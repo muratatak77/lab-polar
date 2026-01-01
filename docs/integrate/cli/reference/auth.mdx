@@ -1,0 +1,131 @@
+---
+title: "polar auth"
+sidebarTitle: "auth"
+description: "Manage your Polar sessions and active organization"
+---
+
+{/* Generated from the CLI by `pnpm --filter @polar-sh/cli docs:generate`. Do not edit by hand. */}
+
+```bash
+polar auth <subcommand> [flags]
+```
+
+**Subcommands**
+
+- [`polar auth login`](#polar-auth-login) Sign in to Polar through your browser
+- [`polar auth whoami`](#polar-auth-whoami) Show the active organization
+- [`polar auth list`](#polar-auth-list) List the organizations you have access to
+- [`polar auth org`](#polar-auth-org) Choose the active organization
+- [`polar auth token`](#polar-auth-token) Create an organization access token for your app and print it
+- [`polar auth logout`](#polar-auth-logout) Sign out and remove saved sessions
+
+## polar auth login
+
+Sign in to Polar through your browser
+
+```bash
+polar auth login [flags]
+```
+
+**Flags**
+
+| Flag | Type | Description |
+| --- | --- | --- |
+| `--sandbox` | `boolean` | Use the sandbox environment |
+| `--production` | `boolean` | Use the production environment |
+| `--new-session` | `boolean` | Sign in again even if a session is already saved |
+
+**Examples**
+
+Choose sandbox or production, then sign in
+```bash
+polar auth login
+```
+
+Sign in to sandbox
+```bash
+polar auth login --sandbox
+```
+
+Sign in to production again, replacing the saved session
+```bash
+polar auth login --production --new-session
+```
+
+## polar auth whoami
+
+Show the active organization
+
+```bash
+polar auth whoami [flags]
+```
+
+## polar auth list
+
+List the organizations you have access to
+
+```bash
+polar auth list [flags]
+```
+
+## polar auth org
+
+Choose the active organization
+
+```bash
+polar auth org [flags]
+```
+
+## polar auth token
+
+Create an organization access token for your app and print it
+
+```bash
+polar auth token [flags]
+```
+
+**Flags**
+
+| Flag | Type | Description |
+| --- | --- | --- |
+| `--scope` | `string` | Scope to preselect on the token page, e.g. products:read. Repeatable |
+
+**Examples**
+
+Add a token for the active organization to .env.local
+```bash
+echo "POLAR_ACCESS_TOKEN=$(polar auth token)" >> .env.local
+```
+
+Preselect scopes and store the token as a GitHub Actions secret without writing it to disk
+```bash
+polar auth token --scope products:read --scope checkouts:write | gh secret set POLAR_ACCESS_TOKEN
+```
+
+## polar auth logout
+
+Sign out and remove saved sessions
+
+```bash
+polar auth logout [flags]
+```
+
+**Flags**
+
+| Flag | Type | Description |
+| --- | --- | --- |
+| `--sandbox` | `boolean` | Use the sandbox environment |
+| `--production` | `boolean` | Use the production environment |
+| `--all` | `boolean` | Remove every saved session |
+
+**Examples**
+
+Sign out, asking which session only if you have both
+```bash
+polar auth logout
+```
+
+Remove every saved session
+```bash
+polar auth logout --all
+```

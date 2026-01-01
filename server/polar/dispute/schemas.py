@@ -1,0 +1,159 @@
+from datetime import datetime
+from typing import Annotated
+
+from fastapi import Path
+from pydantic import UUID4, Field
+
+from polar.customer.schemas.customer import CustomerBase
+from polar.exceptions import ResourceNotFound
+from polar.kit.schemas import (
+    ORDER_ID_EXAMPLE,
+    PAYMENT_ID_EXAMPLE,
+    IDSchema,
+    MultipleQueryFilter,
+    TimestampedSchema,
+)
+from polar.kit.versioning import QuerySchema
+from polar.models.dispute import DisputeStatus
+from polar.order.schemas import OrderID
+from polar.organization.schemas import OrganizationID
+
+DisputeID = Annotated[UUID4, Path(description="The dispute ID.")]
+
+
+class DisputeCustomer(CustomerBase): ...
+
+
+DisputeNotFound = {
+    "description": "Dispute not found.",
+    "model": ResourceNotFound.schema(),
+}
+
+
+class DisputeBase(IDSchema, TimestampedSchema):
+    status: Annotated[
+        DisputeStatus,
+        Field(
+            description=(
+                "Status of the dispute. "
+                "`prevented` means we issued a refund before the dispute was escalated, "
+                "avoiding any fees."
+            ),
+            examples=[DisputeStatus.needs_response, DisputeStatus.prevented],
+        ),
+    ]
+    resolved: Annotated[
+        bool,
+        Field(
+            description="Whether the dispute has been resolved (won or lost).",
+            examples=[False],
+        ),
+    ]
+    closed: Annotated[
+        bool,
+        Field(
+            description="Whether the dispute is closed (prevented, won, or lost).",
+            examples=[False],
+        ),
+    ]
+    amount: Annotated[
+        int, Field(description="Amount in cents disputed.", examples=[1000])
+    ]
+    tax_amount: Annotated[
+        int, Field(description="Tax amount in cents disputed.", examples=[200])
+    ]
+    currency: Annotated[
+        str, Field(description="Currency code of the dispute.", examples=["usd"])
+    ]
+    reason: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The reason for the dispute as reported by the card network "
+                "(e.g. `fraudulent`, `product_not_received`). "
+                "`None` until the processor reports it."
+            ),
+            examples=["fraudulent"],
+        ),
+    ]
+    evidence_due_by: Annotated[
+        datetime | None,
+        Field(
+            description=(
+                "Deadline to submit evidence in response to the dispute. "
+                "`None` when no response is required."
+            ),
+        ),
+    ]
+    past_due: Annotated[
+        bool,
+        Field(
+            description="Whether the evidence submission deadline has passed.",
+            examples=[False],
+        ),
+    ]
+    order_id: Annotated[
+        UUID4,
+        Field(
+            description="The ID of the order associated with the dispute.",
+            examples=[ORDER_ID_EXAMPLE],
+        ),
+    ]
+    payment_id: Annotated[
+        UUID4,
+        Field(
+            description="The ID of the payment associated with the dispute.",
+            examples=[PAYMENT_ID_EXAMPLE],
+        ),
+    ]
+
+
+class Dispute(DisputeBase):
+    """
+    Schema representing a dispute.
+
+    A dispute is a challenge raised by a customer or their bank regarding a payment.
+    """
+
+    evidence_due_by: Annotated[
+        datetime | None,
+        Field(
+            validation_alias="merchant_evidence_due_by",
+            description=(
+                "Deadline to submit evidence in response to the dispute. "
+                "`None` when no response is required."
+            ),
+        ),
+    ]
+    past_due: Annotated[
+        bool,
+        Field(
+            validation_alias="merchant_past_due",
+            description="Whether the evidence submission deadline has passed.",
+            examples=[False],
+        ),
+    ]
+    customer: Annotated[
+        DisputeCustomer,
+        Field(description="The customer who was charged for the disputed payment."),
+    ]
+    case_id: Annotated[
+        UUID4 | None,
+        Field(
+            description=(
+                "The ID of the support case for this dispute, if one was opened."
+            ),
+        ),
+    ]
+
+
+class DisputeListParams(QuerySchema):
+    organization_id: MultipleQueryFilter[OrganizationID] | None = Field(
+        None, title="OrganizationID Filter", description="Filter by organization ID."
+    )
+    order_id: MultipleQueryFilter[OrderID] | None = Field(
+        None, title="OrderID Filter", description="Filter by order ID."
+    )
+    status: MultipleQueryFilter[DisputeStatus] | None = Field(
+        None, title="Status Filter", description="Filter by dispute status."
+    )

@@ -1,0 +1,83 @@
+// Generated from customers:members:update_external (2026-10). Do not edit.
+import type { Polar } from '@polar-sh/sdk/2026-10'
+import { Effect } from 'effect'
+import { Argument, Command, Flag } from 'effect/cli'
+import { ApiRuntime } from '../../runtime'
+import {
+  confirm,
+  fields,
+  data,
+  mergeInput,
+  nullableStringFlag,
+} from '../../inputs'
+
+type Body = NonNullable<
+  Parameters<Polar['customers']['members']['updateExternal']>[2]
+>
+
+export const command = Command.make(
+  'update_external',
+  {
+    confirm,
+    fields,
+    path: {
+      external_id: Argument.String('external_id'),
+      member_external_id: Argument.String('member_external_id'),
+    },
+    data,
+    input: {
+      name: nullableStringFlag('name').pipe(
+        Flag.optional,
+        Flag.withDescription('name'),
+      ),
+      email: nullableStringFlag('email').pipe(
+        Flag.optional,
+        Flag.withDescription('email'),
+      ),
+      role: Flag.Literals('role', ['owner', 'billing_manager', 'member']).pipe(
+        Flag.optional,
+        Flag.withDescription('The role of the member within the customer.'),
+      ),
+    },
+  },
+  (config) =>
+    Effect.gen(function* () {
+      const api = yield* ApiRuntime
+      const body = mergeInput<Body>(config.data, {
+        name: config.input.name,
+        email: config.input.email,
+        role: config.input.role,
+      })
+      yield* api.execute({
+        operationId: 'customers:members:update_external',
+        method: 'PATCH',
+        requiresConfirmation: true,
+        confirm: config.confirm,
+        fields: config.fields,
+        preview: {
+          fields: [
+            { key: 'id', label: 'ID' },
+            { key: 'name', label: 'Name' },
+            { key: 'email', label: 'Email' },
+            { key: 'external_id', label: 'External ID' },
+            { key: 'role', label: 'Role' },
+          ],
+          invoke: (client) =>
+            client.customers.members.getExternal(
+              config.path.external_id,
+              config.path.member_external_id,
+            ),
+        },
+        invoke: (client) =>
+          client.customers.members.updateExternal(
+            config.path.external_id,
+            config.path.member_external_id,
+            body,
+          ),
+      })
+    }),
+).pipe(
+  Command.withDescription(
+    'Update a member by external ID for a customer identified by its external ID.',
+  ),
+)

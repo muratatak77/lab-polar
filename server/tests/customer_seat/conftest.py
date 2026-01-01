@@ -1,0 +1,135 @@
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from polar.enums import SubscriptionRecurringInterval
+from polar.kit.utils import utc_now
+from polar.models import (
+    Customer,
+    Order,
+    Organization,
+    Subscription,
+)
+from polar.models.customer_seat import CustomerSeat, SeatStatus
+from polar.models.order import OrderStatus
+from polar.models.subscription import SubscriptionStatus
+from tests.fixtures.database import SaveFixture
+from tests.fixtures.random_objects import (
+    create_customer_seat,
+    create_member,
+    create_order_with_seats,
+    create_product,
+    create_subscription_with_seats,
+)
+
+
+@pytest.fixture
+async def subscription_with_seats(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    customer: Customer,
+) -> Subscription:
+    product = await create_product(
+        save_fixture,
+        organization=organization,
+        recurring_interval=SubscriptionRecurringInterval.month,
+        prices=[("seat", 1000, "usd")],
+    )
+
+    return await create_subscription_with_seats(
+        save_fixture,
+        product=product,
+        customer=customer,
+        seats=5,
+        status=SubscriptionStatus.active,
+        started_at=utc_now(),
+    )
+
+
+@pytest.fixture
+async def customer_seat_pending(
+    save_fixture: SaveFixture,
+    subscription_with_seats: Subscription,
+    customer: Customer,
+    session: AsyncSession,
+) -> CustomerSeat:
+    # A pending seat points at the billing customer and carries the invited member.
+    member = await create_member(
+        save_fixture,
+        customer=customer,
+        organization=subscription_with_seats.product.organization,
+        email="seat-holder@example.com",
+    )
+    seat = await create_customer_seat(
+        save_fixture,
+        subscription=subscription_with_seats,
+        customer=customer,
+        member=member,
+        email="seat-holder@example.com",
+    )
+    await session.refresh(seat, ["subscription"])
+    assert seat.subscription is not None
+    await session.refresh(seat.subscription, ["product"])
+    assert seat.subscription is not None
+    await session.refresh(seat.subscription.product, ["organization"])
+    return seat
+
+
+@pytest.fixture
+async def customer_seat_claimed(
+    save_fixture: SaveFixture,
+    subscription_with_seats: Subscription,
+    customer: Customer,
+    session: AsyncSession,
+) -> CustomerSeat:
+    seat = await create_customer_seat(
+        save_fixture,
+        subscription=subscription_with_seats,
+        customer=customer,
+        email=customer.email,
+        status=SeatStatus.claimed,
+        claimed_at=utc_now(),
+    )
+    await session.refresh(seat, ["subscription"])
+    assert seat.subscription is not None
+    await session.refresh(seat.subscription, ["product"])
+    assert seat.subscription is not None
+    await session.refresh(seat.subscription.product, ["organization"])
+    return seat
+
+
+@pytest.fixture
+async def order_with_seats(
+    save_fixture: SaveFixture,
+    organization: Organization,
+    customer: Customer,
+) -> Order:
+    product = await create_product(
+        save_fixture,
+        organization=organization,
+        recurring_interval=None,  # One-time purchase
+        prices=[("seat", 1000, "usd")],
+    )
+
+    order = await create_order_with_seats(
+        save_fixture,
+        product=product,
+        customer=customer,
+        seats=5,
+        status=OrderStatus.paid,
+    )
+    return order
+
+
+@pytest.fixture
+async def customer_seat_order_pending(
+    save_fixture: SaveFixture,
+    order_with_seats: Order,
+    session: AsyncSession,
+) -> CustomerSeat:
+    seat = await create_customer_seat(save_fixture, order=order_with_seats)
+    await session.refresh(seat, ["order"])
+    assert seat.order is not None
+    await session.refresh(seat.order, ["product"])
+    assert seat.order is not None
+    await session.refresh(seat.order.product, ["organization"])
+    return seat

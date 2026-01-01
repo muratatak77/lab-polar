@@ -1,0 +1,293 @@
+import functools
+import inspect
+import re
+from collections.abc import Callable, Coroutine
+from typing import Any, Literal, TypedDict
+
+from fastapi import APIRouter as _APIRouter
+from fastapi import Request, Response
+from fastapi.routing import APIRoute
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from polar.config import settings
+from polar.kit.pagination import ListResource
+from polar.openapi import TOOL_ANNOTATIONS, TOOL_DESTRUCTIVE, TOOL_OPEN_WORLD, APITag
+
+
+class TransactionalAPIRoute(APIRoute):
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        endpoint = self.wrap_endpoint(endpoint)
+        super().__init__(path, endpoint, **kwargs)
+
+    def wrap_endpoint(self, endpoint: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(endpoint)
+        async def wrapped_endpoint(*args: Any, **kwargs: Any) -> Any:
+            response = await endpoint(*args, **kwargs)
+
+            # Flush the session right before returning to allow database values to be
+            # filled in prevision of Pydantic's serialization.
+            for argument in (args, *kwargs.values()):
+                if isinstance(argument, AsyncSession):
+                    await argument.flush()
+                    break
+
+            return response
+
+        return wrapped_endpoint
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        route_handler = super().get_route_handler()
+
+        @functools.wraps(route_handler)
+        async def transactional_route_handler(request: Request) -> Response:
+            try:
+                return await route_handler(request)
+            except BaseException:
+                request.state.transaction_failed = True
+                raise
+
+        return transactional_route_handler
+
+
+class IncludedInSchemaAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically sets the `include_in_schema` property
+    depending on the tags.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        tags = self.tags
+        if self.include_in_schema:
+            if APITag.private in tags:
+                self.include_in_schema = settings.is_development()
+            elif APITag.public in tags:
+                self.include_in_schema = True
+            else:
+                self.include_in_schema = False
+
+
+class ToolAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds the `x-tool-*` properties
+    describing the endpoint as a tool, for every route tagged with `APITag.mcp`
+    or `APITag.cli`.
+
+    Each property is derived from the route itself and can be overridden
+    individually by setting it in `openapi_extra`.
+
+    `x-tool-annotations` gets `destructive` for `DELETE` routes and routes marked
+    with `polar.openapi.destructive()`. Routes with a request field marked with
+    `destructive_when_equals()` or `destructive_when_one_of()` get it when the
+    OpenAPI schema is generated, see `polar.openapi.add_destructive_tool_annotations`.
+    Routes marked with `polar.openapi.open_world()` get `open_world`.
+
+    It must come *before* `DocumentedAuthSubjectAPIRoute` in the MRO, so the
+    description is read before the required scopes are appended to it.
+    """
+
+    TOOL_ANNOTATIONS: dict[str, list[str]] = {
+        "GET": ["read_only", "idempotent"],
+        "PUT": ["idempotent"],
+        "DELETE": ["destructive", "idempotent"],
+    }
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        description: str = kwargs.get("description") or endpoint.__doc__ or ""
+        tool_description = inspect.cleandoc(description).split("\f")[0].strip()
+
+        super().__init__(path, endpoint, **kwargs)
+
+        openapi_extra = dict(self.openapi_extra or {})
+        destructive = openapi_extra.pop(TOOL_DESTRUCTIVE, False)
+        open_world = openapi_extra.pop(TOOL_OPEN_WORLD, False)
+        self.openapi_extra = openapi_extra or None
+
+        if APITag.mcp not in self.tags and APITag.cli not in self.tags:
+            return
+
+        annotations: list[str] = []
+        for method in sorted(self.methods or set()):
+            annotations += self.TOOL_ANNOTATIONS.get(method, [])
+        annotations = openapi_extra.get(TOOL_ANNOTATIONS, annotations)
+        if destructive and "destructive" not in annotations:
+            annotations = ["destructive", *annotations]
+        if open_world and "open_world" not in annotations:
+            annotations = [*annotations, "open_world"]
+
+        defaults = {
+            "x-tool-name": self.unique_id.replace(":", "_").replace("-", "_"),
+            "x-tool-title": self.summary or self.name.replace("_", " ").title(),
+            "x-tool-description": tool_description,
+            TOOL_ANNOTATIONS: annotations,
+        }
+        self.openapi_extra = {
+            **{key: value for key, value in defaults.items() if value},
+            **{
+                key: value
+                for key, value in openapi_extra.items()
+                if key != TOOL_ANNOTATIONS
+            },
+        }
+
+
+class SpeakeasyNameOverrideAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds `x-speakeasy-name-override` property
+    following the resolved route name.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        openapi_extra = self.openapi_extra or {}
+        if "x-speakeasy-name-override" not in openapi_extra:
+            self.openapi_extra = {
+                **openapi_extra,
+                "x-speakeasy-name-override": self.name,
+            }
+
+
+class SpeakeasyIgnoreAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds `x-speakeasy-ignore` property
+    to the OpenAPI schema if `APITag.documented` is missing.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        tags = self.tags
+        if APITag.public not in tags:
+            openapi_extra = self.openapi_extra or {}
+            self.openapi_extra = {**openapi_extra, "x-speakeasy-ignore": True}
+
+
+class SpeakeasyGroupAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds `x-speakeasy-group` property
+    to the OpenAPI schema by combining all the non-generic tags.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        non_generic_tags = [
+            str(tag) for tag in self.tags if not isinstance(tag, APITag)
+        ]
+        if len(non_generic_tags) > 0:
+            openapi_extra = self.openapi_extra or {}
+            self.openapi_extra = {
+                **openapi_extra,
+                "x-speakeasy-group": ".".join(non_generic_tags),
+            }
+
+
+class SpeakeasyPaginationAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds `x-speakeasy-pagination` property
+    to the OpenAPI schema if the endpoint response model is a `ListResource`.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        response_model = self.response_model
+        if (
+            response_model is not None
+            and inspect.isclass(response_model)
+            and ListResource in response_model.mro()
+        ):
+            openapi_extra = self.openapi_extra or {}
+            self.openapi_extra = {
+                **openapi_extra,
+                "x-speakeasy-pagination": {
+                    "type": "offsetLimit",
+                    "inputs": [
+                        {
+                            "name": "page",
+                            "in": "parameters",
+                            "type": "page",
+                        },
+                        {
+                            "name": "limit",
+                            "in": "parameters",
+                            "type": "limit",
+                        },
+                    ],
+                    "outputs": {
+                        "results": "$.items",
+                        "numPages": "$.pagination.max_page",
+                    },
+                },
+            }
+
+
+class PaginationExtension(TypedDict):
+    type: Literal["page_limit"]
+    item_schema: dict[str, Any]
+
+
+class PaginationAPIRoute(APIRoute):
+    """
+    A subclass of `APIRoute` that automatically adds `x-polar-pagination` property
+    to the OpenAPI schema if the endpoint response model is a `ListResource`.
+    """
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        super().__init__(path, endpoint, **kwargs)
+        response_model = self.response_model
+        if (
+            response_model is not None
+            and inspect.isclass(response_model)
+            and ListResource in response_model.mro()
+        ):
+            openapi_extra = self.openapi_extra or {}
+            item_schema_name_match = re.match(
+                r"ListResource\[(.+)\]", response_model.__name__
+            )
+            if item_schema_name_match is None:
+                return
+            item_schema_name = item_schema_name_match.group(1)
+            pagination: PaginationExtension = {
+                "type": "page_limit",
+                "item_schema": {"$ref": f"#/components/schemas/{item_schema_name}"},
+            }
+            self.openapi_extra = {**openapi_extra, "x-polar-pagination": pagination}
+
+
+def generate_unique_id_function(route: APIRoute) -> str:
+    parts = [str(tag) for tag in route.tags if not isinstance(tag, APITag)] + [
+        route.name
+    ]
+    return ":".join(parts)
+
+
+def _inherit_signature_from[**P, T](
+    _to: Callable[P, T],
+) -> Callable[[Callable[..., T]], Callable[P, T]]:
+    return lambda x: x  # pyright: ignore
+
+
+def get_api_router_class(route_class: type[APIRoute]) -> type[_APIRouter]:
+    """
+    Returns a subclass of `APIRouter` that uses the given `route_class`.
+    """
+
+    class _CustomAPIRouter(_APIRouter):
+        @_inherit_signature_from(_APIRouter.__init__)
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            kwargs["route_class"] = route_class
+            kwargs["generate_unique_id_function"] = generate_unique_id_function
+            super().__init__(*args, **kwargs)
+
+    return _CustomAPIRouter
+
+
+__all__ = [
+    "IncludedInSchemaAPIRoute",
+    "PaginationAPIRoute",
+    "SpeakeasyGroupAPIRoute",
+    "SpeakeasyIgnoreAPIRoute",
+    "SpeakeasyNameOverrideAPIRoute",
+    "SpeakeasyPaginationAPIRoute",
+    "ToolAPIRoute",
+    "TransactionalAPIRoute",
+    "get_api_router_class",
+]

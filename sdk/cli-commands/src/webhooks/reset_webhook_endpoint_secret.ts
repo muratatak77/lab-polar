@@ -1,0 +1,29 @@
+// Generated from webhooks:reset_webhook_endpoint_secret (2026-10). Do not edit.
+import { Effect } from 'effect'
+import { Argument, Command } from 'effect/cli'
+import { ApiRuntime } from '../runtime'
+import { confirm, fields } from '../inputs'
+
+export const command = Command.make(
+  'reset_webhook_endpoint_secret',
+  {
+    confirm,
+    fields,
+    path: {
+      id: Argument.String('id'),
+    },
+  },
+  (config) =>
+    Effect.gen(function* () {
+      const api = yield* ApiRuntime
+      yield* api.execute({
+        operationId: 'webhooks:reset_webhook_endpoint_secret',
+        method: 'PATCH',
+        requiresConfirmation: true,
+        confirm: config.confirm,
+        fields: config.fields,
+        invoke: (client) =>
+          client.webhooks.resetWebhookEndpointSecret(config.path.id),
+      })
+    }),
+).pipe(Command.withDescription('Regenerate a webhook endpoint secret.'))

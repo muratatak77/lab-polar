@@ -1,0 +1,58 @@
+'use client'
+
+import { PolarEmbedCheckout } from '@polar-sh/checkout/embed'
+import type { schemas } from '@polar-sh/client'
+import { X } from '@polar-sh/orbit/icons'
+import { useCallback, useEffect, useRef } from 'react'
+
+interface CheckoutEmbedCloseProps {
+  checkout: schemas['CheckoutPublic']
+}
+
+const CheckoutEmbedClose: React.FC<
+  React.PropsWithChildren<CheckoutEmbedCloseProps>
+> = ({ checkout }) => {
+  const closeButtonRef = useRef<HTMLButtonElement>(null)
+
+  const onClose = useCallback(() => {
+    if (!checkout.embed_origin) {
+      return
+    }
+    PolarEmbedCheckout.postMessage({ event: 'close' }, checkout.embed_origin)
+  }, [checkout])
+
+  useEffect(() => {
+    const layoutElement = document.getElementById('polar-embed-layout')
+    if (!layoutElement) {
+      return
+    }
+    const outsideClickListener = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (closeButtonRef.current?.contains(target)) {
+        return
+      }
+      const contentElement = document.getElementById('polar-embed-content')
+      if (contentElement && !contentElement.contains(target)) {
+        onClose()
+      }
+    }
+    layoutElement.addEventListener('click', outsideClickListener)
+
+    return () => {
+      layoutElement.removeEventListener('click', outsideClickListener)
+    }
+  }, [onClose])
+
+  return (
+    <button
+      ref={closeButtonRef}
+      type="button"
+      className="dark:bg-polar-950 fixed inset-e-2 top-2 cursor-pointer rounded-full bg-transparent bg-white p-2 shadow-xl md:inset-e-4 md:top-4 dark:text-white"
+      onClick={onClose}
+    >
+      <X className="h-4 w-4 md:h-6 md:w-6" />
+    </button>
+  )
+}
+
+export default CheckoutEmbedClose

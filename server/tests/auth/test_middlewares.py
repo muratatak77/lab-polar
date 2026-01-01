@@ -1,0 +1,846 @@
+import json
+import time
+from datetime import timedelta
+from typing import Any
+from uuid import UUID
+
+import pytest
+from pytest_mock import MockerFixture
+from sqlalchemy import inspect, select
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from starlette.requests import Request
+from starlette.types import Message, Receive, Scope, Send
+
+from polar.auth.exceptions import (
+    InvalidRequestedOrganization,
+    RequestedOrganizationNotAccessible,
+)
+from polar.auth.middlewares import AuthSubjectMiddleware, get_auth_subject
+from polar.auth.models import (
+    ORGANIZATION_HEADER,
+    Anonymous,
+    is_agent,
+    is_single_organization_credential,
+)
+from polar.auth.scope import UNCLAIMED_AGENT_SCOPES
+from polar.auth.service import auth as auth_service
+from polar.config import settings
+from polar.kit.crypto import get_token_hash
+from polar.kit.hash_secrets import HashSecrets
+from polar.kit.utils import utc_now
+from polar.models import (
+    Agent,
+    OAuth2Client,
+    OAuth2Token,
+    Organization,
+    PersonalAccessToken,
+    User,
+    UserOrganization,
+)
+from polar.models.agent import AgentStatus
+from polar.models.oauth2_token_organization import OAuth2TokenOrganization
+from polar.models.user_session_organization import UserSessionOrganization
+from polar.oauth2.constants import ACCESS_TOKEN_PREFIX
+from polar.oauth2.exceptions import InvalidTokenError
+from polar.oauth2.sub_type import SubType
+from polar.personal_access_token.service import TOKEN_PREFIX
+from polar.postgres import AsyncSession
+from polar.redis import Redis
+from tests.fixtures.database import SaveFixture
+
+
+def _request(
+    headers: list[tuple[bytes, bytes]], requested_organization: str | UUID | None
+) -> Request:
+    if requested_organization is not None:
+        headers.append(
+            (ORGANIZATION_HEADER.lower().encode(), str(requested_organization).encode())
+        )
+    return Request({"type": "http", "headers": headers})
+
+
+def _request_with_session_cookie(
+    token: str, *, requested_organization: str | UUID | None = None
+) -> Request:
+    cookie = f"{settings.USER_SESSION_COOKIE_KEY}={token}".encode()
+    return _request([(b"cookie", cookie)], requested_organization)
+
+
+def _request_with_bearer_token(
+    token: str, *, requested_organization: str | UUID | None = None
+) -> Request:
+    header = f"Bearer {token}".encode()
+    return _request([(b"authorization", header)], requested_organization)
+
+
+def _request_without_credentials(requested_organization: UUID) -> Request:
+    return _request([], requested_organization)
+
+
+async def _create_oauth2_token(
+    save_fixture: SaveFixture,
+    access_token: str,
+    *,
+    user: User | None = None,
+    organization: Organization | None = None,
+    agent: Agent | None = None,
+) -> OAuth2Token:
+    if agent is None:
+        client = OAuth2Client(client_id="polar_ci_test")
+        await save_fixture(client)
+    else:
+        client = agent.oauth2_client
+    token = OAuth2Token(
+        client_id=client.client_id,
+        token_type="bearer",
+        access_token=get_token_hash(access_token),
+        scope="",
+        issued_at=int(time.time()),
+        expires_in=3600,
+    )
+    if user is not None:
+        token.user_id = user.id
+        token.sub_type = SubType.user
+    if organization is not None:
+        token.organization_id = organization.id
+        token.sub_type = SubType.organization
+    if agent is not None:
+        token.agent_id = agent.id
+        token.sub_type = SubType.agent
+        token.scope = " ".join(sorted(UNCLAIMED_AGENT_SCOPES))
+    await save_fixture(token)
+    return token
+
+
+@pytest.mark.anyio
+class TestGetAuthSubjectUserSessionScope:
+    async def test_unscoped_session_is_unrestricted(
+        self,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        token, _ = await auth_service._create_user_session(
+            session, user, user_agent="test", scopes=[]
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_session_cookie(token), session
+        )
+
+        assert auth_subject.subject == user
+        assert auth_subject.organization_ids is None
+
+    async def test_scoped_session_populates_organization_ids(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        token, user_session = await auth_service._create_user_session(
+            session, user, user_agent="test", scopes=[]
+        )
+        await save_fixture(
+            UserSessionOrganization(
+                user_session_id=user_session.id, organization_id=organization.id
+            )
+        )
+        auth_subject = await get_auth_subject(
+            _request_with_session_cookie(token), session
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+
+
+@pytest.mark.anyio
+class TestGetAuthSubjectOAuth2TokenScope:
+    async def test_unscoped_user_token_is_unrestricted(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert auth_subject.subject == user
+        assert auth_subject.organization_ids is None
+
+    async def test_scoped_user_token_populates_organization_ids(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        token = await _create_oauth2_token(save_fixture, access_token, user=user)
+        await save_fixture(
+            OAuth2TokenOrganization(
+                oauth2_token_id=token.id, organization_id=organization.id
+            )
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert auth_subject.subject == user
+        assert auth_subject.organization_ids == frozenset({organization.id})
+
+    async def test_organization_token_is_unrestricted(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.organization]}test"
+        await _create_oauth2_token(
+            save_fixture, access_token, organization=organization
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert auth_subject.subject == organization
+        assert auth_subject.organization_ids is None
+
+
+@pytest.mark.anyio
+class TestGetAuthSubjectAgentToken:
+    async def test_unclaimed(
+        self, save_fixture: SaveFixture, session: AsyncSession, agent: Agent
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.agent]}test"
+        await _create_oauth2_token(save_fixture, access_token, agent=agent)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert is_agent(auth_subject)
+        assert auth_subject.subject == agent
+        assert auth_subject.scopes == UNCLAIMED_AGENT_SCOPES
+        assert auth_subject.organization_ids is None
+
+    @pytest.mark.parametrize(
+        "update",
+        [
+            pytest.param(
+                {"status": AgentStatus.claimed, "claimed_at": utc_now()},
+                id="claimed",
+            ),
+            pytest.param(
+                {"status": AgentStatus.revoked, "revoked_at": utc_now()},
+                id="revoked",
+            ),
+            pytest.param({"deleted_at": utc_now()}, id="deleted"),
+        ],
+    )
+    async def test_not_unclaimed(
+        self,
+        update: dict[str, Any],
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        agent: Agent,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.agent]}test"
+        await _create_oauth2_token(save_fixture, access_token, agent=agent)
+        for attribute, value in update.items():
+            setattr(agent, attribute, value)
+        await save_fixture(agent)
+
+        with pytest.raises(InvalidTokenError):
+            await get_auth_subject(_request_with_bearer_token(access_token), session)
+
+
+@pytest.mark.anyio
+class TestGetAuthSubjectRequestedOrganization:
+    async def test_user_token_narrows_to_requested_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization.id
+            ),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+
+    async def test_user_token_non_member_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization_second: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_bearer_token(
+                    access_token, requested_organization=organization_second.id
+                ),
+                session,
+            )
+
+    async def test_unrestricted_user_token_sso_enforced_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        organization.sso_enforced = True
+        await save_fixture(organization)
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_bearer_token(
+                    access_token, requested_organization=organization.id
+                ),
+                session,
+            )
+
+    async def test_user_token_narrows_down_scope(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        organization_second: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        await save_fixture(
+            UserOrganization(user=user, organization=organization_second)
+        )
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        token = await _create_oauth2_token(save_fixture, access_token, user=user)
+        for scoped_organization in (organization, organization_second):
+            await save_fixture(
+                OAuth2TokenOrganization(
+                    oauth2_token_id=token.id, organization_id=scoped_organization.id
+                )
+            )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization_second.id
+            ),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization_second.id})
+
+    async def test_user_token_organization_outside_down_scope(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        organization_second: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        await save_fixture(
+            UserOrganization(user=user, organization=organization_second)
+        )
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        token = await _create_oauth2_token(save_fixture, access_token, user=user)
+        await save_fixture(
+            OAuth2TokenOrganization(
+                oauth2_token_id=token.id, organization_id=organization.id
+            )
+        )
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_bearer_token(
+                    access_token, requested_organization=organization_second.id
+                ),
+                session,
+            )
+
+    async def test_personal_access_token_narrows_to_requested_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        access_token = "polar_pat_test"
+        await save_fixture(
+            PersonalAccessToken(
+                comment="test",
+                token=get_token_hash(access_token),
+                user=user,
+                expires_at=utc_now() + timedelta(days=1),
+                scope="",
+            )
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization.id
+            ),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+
+    async def test_organization_token_own_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.organization]}test"
+        await _create_oauth2_token(
+            save_fixture, access_token, organization=organization
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization.id
+            ),
+            session,
+        )
+
+        assert auth_subject.subject == organization
+
+    async def test_organization_token_other_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+        organization_second: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.organization]}test"
+        await _create_oauth2_token(
+            save_fixture, access_token, organization=organization
+        )
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_bearer_token(
+                    access_token, requested_organization=organization_second.id
+                ),
+                session,
+            )
+
+    async def test_agent_token_own_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        agent: Agent,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.agent]}test"
+        await _create_oauth2_token(save_fixture, access_token, agent=agent)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization.id
+            ),
+            session,
+        )
+
+        assert auth_subject.subject == agent
+
+    async def test_agent_token_other_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        agent: Agent,
+        organization_second: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.agent]}test"
+        await _create_oauth2_token(save_fixture, access_token, agent=agent)
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_bearer_token(
+                    access_token, requested_organization=organization_second.id
+                ),
+                session,
+            )
+
+    async def test_user_session_narrows_to_requested_organization(
+        self,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        token, user_session = await auth_service._create_user_session(
+            session, user, user_agent="test", scopes=[]
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_session_cookie(token, requested_organization=organization.id),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+        assert user_session.organization_scopes == []
+
+    async def test_unrestricted_user_session_sso_enforced_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        organization.sso_enforced = True
+        await save_fixture(organization)
+        token, _ = await auth_service._create_user_session(
+            session, user, user_agent="test", scopes=[]
+        )
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_session_cookie(
+                    token, requested_organization=organization.id
+                ),
+                session,
+            )
+
+    async def test_user_session_organization_outside_down_scope(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        organization_second: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        await save_fixture(
+            UserOrganization(user=user, organization=organization_second)
+        )
+        token, _ = await auth_service._create_user_session(
+            session,
+            user,
+            user_agent="test",
+            scopes=[],
+            organization_ids=frozenset({organization.id}),
+        )
+
+        with pytest.raises(RequestedOrganizationNotAccessible):
+            await get_auth_subject(
+                _request_with_session_cookie(
+                    token, requested_organization=organization_second.id
+                ),
+                session,
+            )
+
+    async def test_sso_session_can_select_its_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        organization.sso_enforced = True
+        await save_fixture(organization)
+        token, _ = await auth_service._create_user_session(
+            session,
+            user,
+            user_agent="test",
+            scopes=[],
+            organization_ids=frozenset({organization.id}),
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_session_cookie(token, requested_organization=organization.id),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+
+    async def test_malformed_organization_id(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        with pytest.raises(InvalidRequestedOrganization):
+            await get_auth_subject(
+                _request_with_bearer_token(access_token, requested_organization="acme"),
+                session,
+            )
+
+    async def test_anonymous_ignores_header(
+        self, session: AsyncSession, organization: Organization
+    ) -> None:
+        auth_subject = await get_auth_subject(
+            _request_without_credentials(organization.id), session
+        )
+
+        assert auth_subject.organization_ids is None
+
+
+@pytest.mark.anyio
+class TestAuthSubjectMiddlewareRequestedOrganization:
+    async def test_inaccessible_organization_returns_403(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization_second: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            raise AssertionError("The request should not reach the app")
+
+        messages: list[Message] = []
+
+        async def send(message: Message) -> None:
+            messages.append(message)
+
+        async def receive() -> Message:
+            return {"type": "http.request", "body": b""}
+
+        request = _request_with_bearer_token(
+            access_token, requested_organization=organization_second.id
+        )
+        await AuthSubjectMiddleware(app)(
+            {**request.scope, "state": {"async_session": session}}, receive, send
+        )
+
+        assert messages[0]["status"] == 403
+        assert json.loads(messages[1]["body"])["error"] == (
+            "RequestedOrganizationNotAccessible"
+        )
+
+
+@pytest.mark.anyio
+class TestAuthSubjectMiddlewareWebSocket:
+    @pytest.mark.parametrize(
+        ("credentials", "status_code"),
+        [("anonymous", None), ("valid", None), ("invalid", 401), ("forbidden", 403)],
+    )
+    async def test_authentication(
+        self,
+        credentials: str,
+        status_code: int | None,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        redis: Redis,
+        user: User,
+        organization_second: Organization,
+        mocker: MockerFixture,
+    ) -> None:
+        secrets = {"k1": "retired", "k2": "current"}
+        hash_secrets = mocker.patch(
+            "polar.kit.crypto.get_hash_secrets",
+            return_value=HashSecrets(secrets, "k1", "legacy"),
+        )
+        access_token = f"{TOKEN_PREFIX}test"
+        personal_access_token = PersonalAccessToken(
+            comment="test",
+            token=get_token_hash(access_token),
+            user=user,
+            expires_at=utc_now() + timedelta(days=1),
+            scope="",
+        )
+        await save_fixture(personal_access_token)
+        original_hash = personal_access_token.token
+        hash_secrets.return_value = HashSecrets(secrets, "k2", "legacy")
+        headers: list[tuple[bytes, bytes]] = []
+        if credentials != "anonymous":
+            token = "invalid" if credentials == "invalid" else access_token
+            headers.append((b"authorization", f"Bearer {token}".encode()))
+        if credentials == "forbidden":
+            headers.append(
+                (
+                    ORGANIZATION_HEADER.lower().encode(),
+                    str(organization_second.id).encode(),
+                )
+            )
+
+        app_called = False
+
+        async def app(scope: Scope, receive: Receive, send: Send) -> None:
+            nonlocal app_called
+            app_called = True
+            assert status_code is None
+            auth_subject = scope["state"]["auth_subject"]
+            if credentials == "anonymous":
+                assert isinstance(auth_subject.subject, Anonymous)
+            else:
+                assert auth_subject.subject.id == user.id
+                assert auth_subject.session.id == personal_access_token.id
+                assert inspect(auth_subject.subject).detached
+            assert "async_session" not in scope["state"]
+
+        messages: list[Message] = []
+
+        async def send(message: Message) -> None:
+            messages.append(message)
+
+        async def receive() -> Message:
+            return {"type": "websocket.connect"}
+
+        await AuthSubjectMiddleware(app)(
+            {
+                "type": "websocket",
+                "headers": headers,
+                "extensions": {"websocket.http.response": {}},
+                "state": {
+                    "async_sessionmaker": async_sessionmaker(
+                        bind=session.bind,
+                        expire_on_commit=False,
+                        join_transaction_mode="create_savepoint",
+                    ),
+                    "redis": redis,
+                },
+            },
+            receive,
+            send,
+        )
+
+        stored_hash = await session.scalar(
+            select(PersonalAccessToken.token).where(
+                PersonalAccessToken.id == personal_access_token.id
+            )
+        )
+        assert stored_hash == (
+            get_token_hash(access_token) if credentials == "valid" else original_hash
+        )
+        assert app_called == (status_code is None)
+        if status_code is None:
+            assert messages == []
+        else:
+            assert messages[0]["type"] == "websocket.http.response.start"
+            assert messages[0]["status"] == status_code
+            assert messages[1]["type"] == "websocket.http.response.body"
+            body = json.loads(messages[1]["body"])
+            if credentials == "invalid":
+                assert body["error"] == "invalid_token"
+            else:
+                assert body["error"] == "RequestedOrganizationNotAccessible"
+
+
+@pytest.mark.anyio
+class TestIsSingleOrganizationCredential:
+    async def test_agent_token(
+        self, save_fixture: SaveFixture, session: AsyncSession, agent: Agent
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.agent]}test"
+        await _create_oauth2_token(save_fixture, access_token, agent=agent)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert is_single_organization_credential(auth_subject)
+
+    async def test_organization_token(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.organization]}test"
+        await _create_oauth2_token(
+            save_fixture, access_token, organization=organization
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert is_single_organization_credential(auth_subject)
+
+    async def test_user_token_scoped_to_one_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        token = await _create_oauth2_token(save_fixture, access_token, user=user)
+        await save_fixture(
+            OAuth2TokenOrganization(
+                oauth2_token_id=token.id, organization_id=organization.id
+            )
+        )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert is_single_organization_credential(auth_subject)
+
+    async def test_user_token_scoped_to_several_organizations(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        organization_second: Organization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        token = await _create_oauth2_token(save_fixture, access_token, user=user)
+        for scoped_organization in (organization, organization_second):
+            await save_fixture(
+                OAuth2TokenOrganization(
+                    oauth2_token_id=token.id, organization_id=scoped_organization.id
+                )
+            )
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(access_token), session
+        )
+
+        assert not is_single_organization_credential(auth_subject)
+
+    async def test_unscoped_user_token_narrowed_by_header(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        user: User,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        access_token = f"{ACCESS_TOKEN_PREFIX[SubType.user]}test"
+        await _create_oauth2_token(save_fixture, access_token, user=user)
+
+        auth_subject = await get_auth_subject(
+            _request_with_bearer_token(
+                access_token, requested_organization=organization.id
+            ),
+            session,
+        )
+
+        assert auth_subject.organization_ids == frozenset({organization.id})
+        assert not is_single_organization_credential(auth_subject)

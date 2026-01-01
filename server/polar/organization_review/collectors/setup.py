@@ -1,0 +1,347 @@
+import asyncio
+from urllib.parse import urlparse
+
+import httpx
+import structlog
+
+from polar.kit.http import (
+    SSRFBlockedError,
+    SSRFSafeTransport,
+    resolve_and_validate_ip,
+)
+from polar.models.checkout_link import CheckoutLink
+from polar.models.webhook_endpoint import WebhookEndpoint
+
+from ..known_domains import match_known_domain
+from ..schemas import (
+    CheckoutLinkBenefitData,
+    CheckoutLinksData,
+    CheckoutReturnUrlData,
+    CheckoutSuccessUrlData,
+    IntegrationData,
+    SetupData,
+    UrlRedirectInfo,
+    WebhookEndpointData,
+)
+from .firecrawl_client import scrape_markdown
+
+log = structlog.get_logger(__name__)
+
+# Timeout for following redirects on a single URL
+_REDIRECT_TIMEOUT = 5.0
+# Maximum number of URLs to resolve redirects for
+_MAX_URLS_TO_RESOLVE = 20
+# Maximum concurrent redirect resolutions
+_MAX_CONCURRENT = 5
+
+
+def _extract_domain(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc or None
+    except Exception:
+        return None
+
+
+def same_registrable_domain(host_a: str, host_b: str) -> bool:
+    """Whether two hosts share a registrable domain after stripping `www.`.
+
+    Subdomains on the same parent are treated as the same domain. Uses suffix
+    matching rather than a hand-rolled SLD split so multi-part TLDs like
+    `*.co.uk` don't collapse false-positives.
+    """
+    a = host_a.lower().removeprefix("www.")
+    b = host_b.lower().removeprefix("www.")
+    if not a or not b:
+        return False
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def is_same_or_subdomain(host: str, domain: str) -> bool:
+    """Whether `host` is `domain` or one of its subdomains, ignoring `www.` and ports."""
+    host = (urlparse(f"//{host}").hostname or "").removeprefix("www.")
+    domain = domain.lower().removeprefix("www.")
+    return bool(host) and (host == domain or host.endswith("." + domain))
+
+
+def is_on_verified_domain(host: str, verified_domains: list[str]) -> bool:
+    return any(is_same_or_subdomain(host, d) for d in verified_domains)
+
+
+def _is_cross_domain(original_url: str, final_url: str) -> bool:
+    """Return True if two URLs' hosts don't share a registrable domain.
+
+    Returns False if either host is missing (unparseable URLs are not
+    treated as cross-domain redirects — they surface via the error field).
+    """
+    original = urlparse(original_url).hostname
+    final = urlparse(final_url).hostname
+    if original is None or final is None:
+        return False
+    return not same_registrable_domain(original, final)
+
+
+def _unique_domains(urls: list[str]) -> list[str]:
+    """Extract and deduplicate domains from a list of URLs, preserving order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        domain = _extract_domain(url)
+        if domain and domain not in seen:
+            seen.add(domain)
+            result.append(domain)
+    return result
+
+
+def _validate_url_scheme(url: str) -> None:
+    """Raise ValueError if the URL scheme is not http or https."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"invalid scheme: {parsed.scheme}")
+
+
+async def _validate_url_host(url: str) -> None:
+    """Validate that the URL host does not resolve to a private/reserved IP."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if hostname:
+        await resolve_and_validate_ip(hostname)
+
+
+async def _resolve_redirect(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    url: str,
+) -> UrlRedirectInfo:
+    """Follow redirects on a URL and return where it ultimately lands.
+
+    Uses a manual redirect loop to validate each hop's scheme. The client's
+    `SSRFSafeTransport` blocks hops that resolve to private IPs.
+    """
+    try:
+        _validate_url_scheme(url)
+    except ValueError:
+        return UrlRedirectInfo(original_url=url, error="blocked")
+
+    async with semaphore:
+        try:
+            # Use manual redirect loop so we can validate each hop.
+            # We use GET rather than HEAD because some sites block HEAD requests.
+            current_url = url
+            hops: list[str] = []
+            for _ in range(10):  # max redirect hops
+                try:
+                    response = await client.get(current_url)
+                except SSRFBlockedError:
+                    error = "redirect_blocked" if hops else "blocked"
+                    return UrlRedirectInfo(original_url=url, error=error)
+                if response.is_redirect and response.has_redirect_location:
+                    next_url = str(response.headers["location"])
+                    # Resolve relative redirects
+                    if not next_url.startswith(("http://", "https://")):
+                        next_url = str(response.url.join(next_url))
+                    try:
+                        _validate_url_scheme(next_url)
+                    except ValueError:
+                        return UrlRedirectInfo(
+                            original_url=url, error="redirect_blocked"
+                        )
+                    current_url = next_url
+                    hops.append(next_url)
+                else:
+                    break
+
+            # On hitting the hop limit, the last redirect target is never
+            # fetched but is still where the chain leads.
+            final_url = current_url
+            # A chain can leave the domain and come back, so every hop counts.
+            redirected = any(_is_cross_domain(url, hop) for hop in hops)
+            return UrlRedirectInfo(
+                original_url=url,
+                final_url=final_url,
+                final_domain=_extract_domain(final_url),
+                hops=hops[:-1],
+                redirected=redirected,
+            )
+        except httpx.TimeoutException:
+            return UrlRedirectInfo(original_url=url, error="timeout")
+        except Exception:
+            return UrlRedirectInfo(original_url=url, error="connection_error")
+
+
+def _pick_one_per_hostname(urls: list[str]) -> list[str]:
+    """Pick one URL per unique hostname — no need to check every URL on the same host."""
+    seen: set[str | None] = set()
+    result: list[str] = []
+    for url in urls:
+        hostname = urlparse(url).hostname
+        if hostname not in seen:
+            seen.add(hostname)
+            result.append(url)
+    return result
+
+
+async def _resolve_redirect_with_browser(url: str) -> UrlRedirectInfo:
+    """Detect client-side redirects (meta refresh, JS) via Firecrawl Cloud.
+
+    Firecrawl follows HTTP/JS/meta-refresh redirects server-side and reports the
+    final URL; we compare its domain against the original. Egress is Firecrawl's
+    network rather than ours, so only the scheme/host pre-flight applies.
+    """
+    try:
+        _validate_url_scheme(url)
+        await _validate_url_host(url)
+    except ValueError, SSRFBlockedError:
+        return UrlRedirectInfo(original_url=url, error="blocked")
+
+    try:
+        result = await scrape_markdown(url)
+    except Exception:
+        log.warning("setup_collector.firecrawl_redirect_error", url=url, exc_info=True)
+        return UrlRedirectInfo(original_url=url, error="browser_error")
+
+    final_url = result.url
+    final_domain = _extract_domain(final_url)
+    redirected = _is_cross_domain(url, final_url)
+    return UrlRedirectInfo(
+        original_url=url,
+        final_url=final_url,
+        final_domain=final_domain,
+        redirected=redirected,
+    )
+
+
+async def resolve_url_redirects(urls: list[str]) -> list[UrlRedirectInfo]:
+    """Follow redirects for a sample of URLs (one per hostname).
+
+    Uses a two-pass approach:
+    1. GET requests to detect HTTP-level redirects (301/302).
+    2. For URLs that returned 200 (no HTTP redirect), a headless browser
+       check to detect client-side redirects (meta refresh, JS).
+    """
+    if not urls:
+        return []
+
+    urls_to_check = _pick_one_per_hostname(urls)[:_MAX_URLS_TO_RESOLVE]
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+
+    # Pass 1: GET requests (fast)
+    async with httpx.AsyncClient(
+        transport=SSRFSafeTransport(),
+        follow_redirects=False,  # We follow manually to validate each hop
+        timeout=_REDIRECT_TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; PolarReviewBot/1.0)"},
+    ) as client:
+        results = list(
+            await asyncio.gather(
+                *[_resolve_redirect(client, semaphore, url) for url in urls_to_check]
+            )
+        )
+
+    # Pass 2: browser check for URLs that HEAD didn't detect as redirected
+    needs_browser = [r for r in results if not r.redirected and r.error is None]
+    if needs_browser:
+        result_map = {r.original_url: r for r in results}
+        for info in needs_browser:
+            browser_result = await _resolve_redirect_with_browser(info.original_url)
+            if browser_result.redirected or browser_result.error:
+                result_map[info.original_url] = browser_result
+        results = [result_map[url] for url in urls_to_check if url in result_map]
+
+    redirected = [r for r in results if r.redirected]
+    if redirected:
+        log.warning(
+            "setup_collector.redirects_detected",
+            count=len(redirected),
+            urls=[(r.original_url, r.final_url) for r in redirected],
+        )
+
+    return results
+
+
+def collect_setup_data(
+    checkout_links: list[CheckoutLink],
+    checkout_return_urls: list[str],
+    checkout_success_urls: list[str],
+    api_key_count: int,
+    webhook_endpoints: list[WebhookEndpoint],
+    *,
+    success_url_redirects: list[UrlRedirectInfo] | None = None,
+    return_url_redirects: list[UrlRedirectInfo] | None = None,
+) -> SetupData:
+    # Checkout success URLs — merge from both CheckoutLink and Checkout sources
+    unique_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for link in checkout_links:
+        if link.success_url and link.success_url not in seen_urls:
+            seen_urls.add(link.success_url)
+            unique_urls.append(link.success_url)
+    for url in checkout_success_urls:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_urls.append(url)
+
+    success_url_data = CheckoutSuccessUrlData(
+        unique_urls=unique_urls,
+        domains=_unique_domains(unique_urls),
+        redirect_results=success_url_redirects or [],
+    )
+
+    # Checkout return URLs (from the checkouts table, API-created)
+    return_url_data = CheckoutReturnUrlData(
+        unique_urls=checkout_return_urls,
+        domains=_unique_domains(checkout_return_urls),
+        redirect_results=return_url_redirects or [],
+    )
+
+    # Checkout links with benefit info
+    link_data_list: list[CheckoutLinkBenefitData] = []
+    links_without_benefits = 0
+    for link in checkout_links:
+        product_names: list[str] = []
+        has_benefits = False
+        for clp in link.checkout_link_products:
+            product = clp.product
+            product_names.append(product.name)
+            if product.product_benefits:
+                has_benefits = True
+
+        if not has_benefits:
+            links_without_benefits += 1
+
+        link_data_list.append(
+            CheckoutLinkBenefitData(
+                label=str(link.label) if link.label else None,
+                product_names=product_names,
+                has_benefits=has_benefits,
+            )
+        )
+
+    checkout_links_data = CheckoutLinksData(
+        total_links=len(checkout_links),
+        links_without_benefits=links_without_benefits,
+        links=link_data_list,
+    )
+
+    # Integration data
+    webhook_endpoint_data = [
+        WebhookEndpointData(url=ep.url, enabled=ep.enabled) for ep in webhook_endpoints
+    ]
+    webhook_urls = [ep.url for ep in webhook_endpoints]
+    webhook_domains = _unique_domains(webhook_urls)
+
+    integration_data = IntegrationData(
+        api_key_count=api_key_count,
+        webhook_endpoints=webhook_endpoint_data,
+        webhook_domains=webhook_domains,
+        webhook_known_service_domains=[
+            d for d in webhook_domains if match_known_domain(d) is not None
+        ],
+    )
+
+    return SetupData(
+        checkout_success_urls=success_url_data,
+        checkout_return_urls=return_url_data,
+        checkout_links=checkout_links_data,
+        integration=integration_data,
+    )

@@ -1,0 +1,272 @@
+import { getQueryClient } from '@/utils/api/query'
+import { runBulk } from '@/utils/bulk'
+import { api } from '@/utils/client'
+import { operations, schemas, unwrap } from '@polar-sh/client'
+import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
+import { defaultRetry } from './retry'
+
+export const useProducts = (
+  organizationId: string | string[],
+  parameters?: Omit<
+    NonNullable<operations['products:list']['parameters']['query']>,
+    'organization_id'
+  >,
+) =>
+  useQuery({
+    queryKey: ['products', { organizationId, ...(parameters || {}) }],
+    queryFn: () =>
+      unwrap(
+        api.GET('/v1/products/', {
+          params: {
+            query: {
+              organization_id: organizationId,
+              ...(parameters?.id ? {} : { catalog_status: 'live' as const }),
+              is_archived:
+                parameters?.is_archived === undefined
+                  ? false
+                  : parameters?.is_archived,
+              ...(parameters || {}),
+            },
+          },
+        }),
+      ),
+    retry: defaultRetry,
+    placeholderData: keepPreviousData,
+  })
+
+// One product per external_id, preferring the current version, then the newest.
+export const latestVersions = (products: schemas['Product'][]) => {
+  const byKey = new Map<string, schemas['Product']>()
+  for (const product of products) {
+    const key = product.external_id ?? product.id
+    const kept = byKey.get(key)
+    if (
+      !kept ||
+      (product.is_current === kept.is_current
+        ? product.created_at > kept.created_at
+        : product.is_current)
+    ) {
+      byKey.set(key, product)
+    }
+  }
+  return [...byKey.values()]
+}
+
+type ProductSelector =
+  | { id: string[] }
+  | { organization_id: string; external_id: string[] }
+
+export const useSelectedProducts = (
+  selector: ProductSelector,
+  {
+    includeArchived = false,
+    // Versions outside the live catalog, unlike the archived flag above.
+    includeAllVersions = false,
+  }: { includeArchived?: boolean; includeAllVersions?: boolean } = {},
+) =>
+  useQuery({
+    queryKey: ['products', selector, includeArchived, includeAllVersions],
+    queryFn: async () => {
+      const products: schemas['Product'][] = []
+      let page = 1
+      while (true) {
+        const data = await unwrap(
+          api.GET('/v1/products/', {
+            params: {
+              query: {
+                ...selector,
+                ...('id' in selector || includeAllVersions
+                  ? {}
+                  : { catalog_status: 'live' as const }),
+                is_archived: includeArchived ? null : false,
+                page,
+                limit: 100,
+              },
+            },
+          }),
+        )
+        products.push(...data.items)
+        if (page >= data.pagination.max_page) {
+          break
+        }
+        page++
+      }
+      return products
+    },
+    placeholderData: keepPreviousData,
+    retry: defaultRetry,
+    enabled: ('id' in selector ? selector.id : selector.external_id).length > 0,
+  })
+
+export const useProduct = (id?: string | null) =>
+  useQuery({
+    queryKey: ['products', { id }],
+    queryFn: () =>
+      unwrap(
+        api.GET('/v1/products/{id}', { params: { path: { id: id ?? '' } } }),
+      ),
+    retry: defaultRetry,
+    enabled: !!id,
+  })
+
+export const useCreateProduct = (organization: schemas['Organization']) =>
+  useMutation({
+    mutationFn: (body: schemas['ProductCreate']) => {
+      return api.POST('/v1/products/', { body })
+    },
+    onSuccess: async (result) => {
+      if (result.error) {
+        return
+      }
+
+      getQueryClient().invalidateQueries({
+        queryKey: ['products', { organizationId: organization.id }],
+      })
+    },
+  })
+
+export const useUpdateProduct = (organization: schemas['Organization']) =>
+  useMutation({
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: string
+      body: schemas['ProductUpdate']
+    }) => {
+      return api.PATCH('/v1/products/{id}', {
+        params: { path: { id } },
+        body,
+      })
+    },
+    onSuccess: async (result, variables) => {
+      if (result.error) {
+        return
+      }
+      const queryClient = getQueryClient()
+      queryClient.invalidateQueries({
+        queryKey: ['products', { organizationId: organization.id }],
+      })
+      queryClient.invalidateQueries({
+        queryKey: ['products', { id: variables.id }],
+      })
+    },
+  })
+
+export const useDeleteProduct = (organization: schemas['Organization']) =>
+  useMutation({
+    mutationFn: (product: schemas['Product']) => {
+      return api.DELETE('/v1/products/{id}', {
+        params: { path: { id: product.id } },
+      })
+    },
+    onSuccess: async (result, variables) => {
+      if (result.error) {
+        return
+      }
+      const queryClient = getQueryClient()
+      queryClient.invalidateQueries({
+        queryKey: ['products', { organizationId: organization.id }],
+      })
+      queryClient.invalidateQueries({
+        queryKey: ['products', { id: variables.id }],
+      })
+    },
+  })
+
+export const useUpdateProducts = () =>
+  useMutation({
+    mutationFn: ({
+      products,
+      body,
+    }: {
+      products: schemas['Product'][]
+      body: schemas['ProductUpdate']
+    }) =>
+      runBulk(products, async (product) => {
+        const { error } = await api.PATCH('/v1/products/{id}', {
+          params: { path: { id: product.id } },
+          body,
+        })
+        if (error) {
+          throw error
+        }
+      }),
+    onSuccess: (result) => {
+      if (result.succeeded.length === 0) {
+        return
+      }
+      getQueryClient().invalidateQueries({ queryKey: ['products'] })
+    },
+  })
+
+export const useUpdateProductBenefits = (
+  organization: schemas['Organization'],
+) =>
+  useMutation({
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: string
+      body: schemas['ProductBenefitsUpdate']
+    }) => {
+      return api.POST('/v1/products/{id}/benefits', {
+        params: { path: { id } },
+        body,
+      })
+    },
+    onSuccess: async (result, variables) => {
+      if (result.error) {
+        return
+      }
+      const queryClient = getQueryClient()
+      queryClient.invalidateQueries({
+        queryKey: ['products', { organizationId: organization.id }],
+      })
+
+      queryClient.invalidateQueries({
+        queryKey: ['products', { id: variables.id }],
+      })
+    },
+  })
+
+// With config-as-code, each catalog publish adds new product rows, so saved IDs
+// can point at old versions. Map each one to the current row with the same
+// external_id. Products without a current row keep their saved ID.
+export const useCurrentProductIds = (
+  organization: schemas['Organization'],
+  productIds: string[],
+) => {
+  const enabled = !!organization.feature_settings?.config_as_code_enabled
+  const savedQuery = useSelectedProducts(
+    { id: enabled ? productIds : [] },
+    { includeArchived: true },
+  )
+  const saved = savedQuery.data
+  const externalIds = saved?.flatMap((product) => product.external_id ?? [])
+  const currentQuery = useSelectedProducts(
+    { organization_id: organization.id, external_id: externalIds ?? [] },
+    { includeArchived: true },
+  )
+  const current = currentQuery.data
+  if (savedQuery.isLoading || currentQuery.isLoading) {
+    return undefined
+  }
+  // Disabled, nothing to map, or a failed lookup: keep the saved IDs.
+  if (!saved || !current) {
+    return productIds
+  }
+  const currentIds = new Map(
+    current.map((product) => [product.external_id, product.id]),
+  )
+  return [
+    ...new Set(
+      saved.map(
+        (product) =>
+          (product.external_id && currentIds.get(product.external_id)) ||
+          product.id,
+      ),
+    ),
+  ]
+}

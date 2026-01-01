@@ -1,0 +1,244 @@
+# Polar
+
+Open source payment infrastructure platform for developers. Monorepo with a Python/FastAPI
+backend and a Next.js frontend.
+
+This file is the entry point for AI agents working in this repo: start here, then read the
+per-area `AGENTS.md` linked from the Architecture and Conventions sections before writing code.
+
+## General Guidelines
+
+- Do not add comments unless necessary — the code should be self-explanatory.
+- Use meaningful variable and function names.
+- Follow established conventions and good practices (SOLID, maintainable code).
+- Do not modify code unrelated to the task or issue you are working on.
+- Do not create GitHub pull requests unless the user explicitly asks. Commit and
+  push the branch as needed; leave opening the PR to the user. Open the PR the way
+  the user asked. A plain "open a PR", or the host's Create PR button, is just
+  `gh pr create`. Run the `open-pr` skill only when the user names it (`/open-pr`):
+  it runs lint, type-check, tests and two review passes, and takes several minutes.
+  Do not mark a PR ready for review unless told so.
+
+## Architecture
+
+```
+polar/
+├── server/                 # Python/FastAPI backend — see server/AGENTS.md
+│   ├── polar/
+│   │   ├── {module}/
+│   │   │   ├── endpoints.py     # FastAPI routes
+│   │   │   ├── service.py       # Business logic (singleton)
+│   │   │   ├── repository.py    # Database queries (SQLAlchemy)
+│   │   │   ├── schemas.py       # Pydantic models
+│   │   │   └── tasks.py         # Dramatiq background jobs
+│   │   ├── models/             # SQLAlchemy models (global, not per-module)
+│   │   └── backoffice/         # Admin UI (HTMX + DaisyUI) — see server/polar/backoffice/AGENTS.md
+│   └── migrations/             # Alembic database migrations
+├── clients/                # Turborepo + pnpm frontend — see clients/AGENTS.md
+│   ├── adapters/               # Published framework and authentication adapters
+│   ├── apps/web/               # Next.js dashboard
+│   ├── apps/app/               # Expo / React Native (iOS + Android)
+│   ├── apps/orbit/             # Orbit design-system showcase
+│   ├── packages/orbit/         # Orbit design system (components + tokens)
+│   ├── packages/ui/            # Legacy shared components (Radix + Tailwind)
+│   ├── packages/client/        # Generated API client + data hooks
+│   └── packages/i18n/          # Translations
+├── dev/                    # Dev scripts and tooling
+├── docs/                   # User/developer docs (Mintlify)
+├── sdk/                    # SDKs and generators
+│   ├── generator/              # Internal SDK code generator
+│   ├── python/                 # Generated Python SDK
+│   └── overlays/               # OpenAPI Overlay tweaks for Speakeasy-generated SDKs
+├── .agents/                # Agent Skills (Cursor, Claude, Codex)
+└── .claude/                # Claude Code config (settings, hooks). skills/ → ../.agents/skills
+```
+
+The TypeScript API client is generated from the backend's OpenAPI schema. After changing the
+API, run `pnpm run generate` in `clients/packages/client`.
+
+## Setup
+
+```bash
+./dev/setup-environment     # generate .env files
+# For GitHub integration:
+./dev/setup-environment --setup-github-app --backend-external-url https://yourdomain.ngrok.dev
+```
+
+**Backend** (http://127.0.0.1:8000) — from `server/`:
+```bash
+../dev/setup-environment      # generates server/.env — must run BEFORE docker compose
+docker compose up -d          # PostgreSQL, Redis, Minio
+uv sync                       # install deps
+uv run task api               # API server
+uv run task worker            # background worker (separate terminal)
+```
+
+`docker-compose.yml` interpolates the Postgres credentials and MinIO bucket names from
+`server/.env`. Without that file they expand to empty strings and the `db` and `minio-setup`
+containers exit 1 — **while `docker compose up -d` still exits 0**. Verify with `docker ps -a`,
+not the exit code. (`dev up` gets this order right; only the manual sequence above used to not.)
+
+**Frontend** (http://127.0.0.1:3000) — from `clients/`:
+```bash
+pnpm install && pnpm dev
+```
+
+**Stripe** — add to `server/.env`:
+- `POLAR_STRIPE_SECRET_KEY`
+- `POLAR_STRIPE_PUBLISHABLE_KEY`
+- `POLAR_STRIPE_WEBHOOK_SECRET`
+- `POLAR_STRIPE_CONNECT_WEBHOOK_SECRET`
+
+**Fresh worktrees** (`.claude/worktrees/`) don't carry `.env` or built artifacts. Before running
+tests in a new worktree, from the repo root:
+```bash
+./dev/setup-environment       # generates server/.env and clients/apps/web/.env.local
+uv run --directory server task emails   # builds server/emails/bin/react-email-pkg
+```
+Without the email renderer, pytest fails at config load with an
+`EMAIL_RENDERER_BINARY_PATH` error.
+
+One artifact actually blocks config import: *any existing file* at
+`EMAIL_RENDERER_BINARY_PATH` — the validator only checks that the path exists. When you need to
+collect tests, lint or typecheck without waiting on the ~60s email build, do what
+`test_sdk.yaml` does: `touch /tmp/email-renderer` and set
+`POLAR_EMAIL_RENDERER_BINARY_PATH=/tmp/email-renderer`. Tests that render an email will fail,
+nothing else will.
+
+## Development Workflow
+
+**Always prefix Python commands with `uv run`** — it guarantees the correct Python (3.14),
+project dependencies, environment variables, and virtualenv context.
+
+```bash
+cd server
+uv run task test_fast                                     # backend tests, parallel, no coverage
+uv run task lint && uv run task lint_types                # lint + type-check
+uv run alembic revision --autogenerate -m "description"   # generate a migration from model changes
+uv run alembic upgrade head                               # apply migrations
+```
+
+`uv run task test` adds coverage and runs serially. Use `task test_fast` (`-n auto`, no coverage)
+interactively, or scope to a path: `POLAR_ENV=testing uv run python -m pytest tests/<module>`.
+
+Set `POLAR_TEST_DATABASE_TEMPLATE=polar_test` (with `polar_test` created and migrated) and each
+xdist worker clones that database instead of replaying the whole migration history into its own
+— see `tests/fixtures/database.py`. CI does this in `test_server.yaml`. **If you add a migration,
+re-run `POLAR_ENV=testing uv run task db_migrate` to refresh the template**, or workers will
+clone a stale schema.
+
+**Visual regression testing** — use `dev snap` to capture before/after screenshots across branches:
+```bash
+dev snap --branch my-feature        # test a specific branch
+dev snap --detect                   # auto-detect URLs from git diff
+```
+
+The customer portal authenticates with a session token rather than the dashboard login, so
+`dev snap` can't reach it on its own. Get its URLs from `dev portal-urls --snap` first.
+
+See `server/AGENTS.md` for backend command and testing specifics.
+
+## Conventions
+
+Detailed, review-enforced patterns live next to the code — read the relevant file before writing:
+
+- **Backend** → `server/AGENTS.md`: modular structure, repository/service/endpoint patterns,
+  `lazy="raise"` relationships, status-coded `PolarError`, endpoints return ORM models,
+  authentication (`AuthSubject` + scopes).
+- **Frontend** → `clients/AGENTS.md`: Orbit `<Box />` design system (raw Tailwind is **deprecated**
+  for layout/spacing/color/etc.), TanStack Query for data, Zustand for state, 250-line `max-lines` limit,
+  React Compiler is on for web/orbit (no manual memoization there; react-hook-form via `useWatch`/`useFormState`).
+- **Backoffice** → `server/polar/backoffice/AGENTS.md`: HTMX + DaisyUI patterns.
+
+**i18n:** add new translatable strings only to `clients/packages/i18n/src/locales/en.ts` — a CI
+job auto-translates the rest. Don't edit other locale files. (More in `clients/AGENTS.md`.)
+
+## Architecture Decisions (ADRs)
+
+Significant, cross-cutting, or hard-to-reverse decisions are recorded as short ADRs in
+`handbook/engineering/decisions/` (see the [index](handbook/engineering/decisions/index.mdx)).
+Treat **Accepted** ADRs as binding:
+
+- Before changing a load-bearing pattern, check for a relevant ADR (grep that directory).
+- If code contradicts an Accepted ADR, flag it and cite the id (e.g. "violates ADR-0002").
+- If a change makes a significant decision no ADR covers, propose a new one from
+  `handbook/engineering/decisions/template.mdx` rather than losing the rationale in the diff.
+- **ADR-0012:** AI API prompts send only the fields the feature needs. Do not
+  dump a whole org, customer, or payment object into a model call.
+
+## Skills
+
+Reusable workflows live in `.agents/skills/`. `.claude/skills` is a symlink to that
+directory. Invoke as `/name` in Cursor and Claude Code, or `$name` in Codex.
+
+- `polar-code-review` — Polar-specific review of the branch diff. Bugs, security, and simplification are `/code-review`, `/security-review`, and `/simplify`.
+- `open-pr` — draft PR after lint, type-check, `test_fast`, `polar-code-review`, and cubic CLI (`CUBIC_API_KEY`). Do not mark ready unless asked.
+
+## Documentation
+
+- **Handbook**: https://handbook.polar.sh/engineering/
+- **Design docs**: `handbook/engineering/design-documents/` — write one only when
+  Polar stores or processes new data, changes login or permissions, adds a
+  new system, or adds a third-party tool that can see Polar data. Not every
+  new API endpoint. Copy `template.mdx`.
+  https://handbook.polar.sh/engineering/design-documents/
+- **API guidelines**: https://handbook.polar.sh/engineering/rest-api-guidelines
+- **User/developer docs**: `docs/` (Mintlify) — `cd docs && pnpm dev` to serve locally.
+
+Mintlify API reference is generated from committed `docs/openapi/{version}.openapi.json`. After
+changing public endpoints or webhooks, from `sdk/generator/`:
+
+```bash
+just openapi        # server → sdk/generator/openapi/
+just docs-openapi   # public spec + SDK samples → docs/openapi/
+```
+
+Add new operations and webhooks to the matching groups in `docs/docs.json`; that file is not generated.
+
+## Key Integrations
+
+- **Stripe**: payments and subscriptions. Needs API keys + webhook secret in `server/.env`.
+- **GitHub**: authentication and repository features. Needs a GitHub App configured for local dev.
+- **Slack**: workspace integration for notifications. Configured via OAuth at runtime (no `.env` setup).
+- **S3 / Minio**: file storage.
+- **Redis**: cache and job queue.
+- **PostgreSQL**: primary database.
+
+## Driving the local UI
+
+**Login.** Email OTP codes are printed in the API pane / log (`LOGIN CODE: …`). Grab with
+`tmux capture-pane -t polar:services.0 -p | grep -a "LOGIN CODE" | tail -1`. `admin@polar.sh`
+is the conventional test account.
+
+**Onboarding gotcha.** The org-creation wizard's "Launch Dashboard" button only submits once the
+Product step's required fields are filled (description ≥30 chars, ≥1 selling category, ≥1 pricing
+model). The AUP AI check auto-APPROVEs when `PYDANTIC_AI_GATEWAY_API_KEY` is unset.
+
+## Cloud agent environments
+
+Running in Claude Code on the web or a Cursor Cloud VM? Read `dev/CLOUD_AGENTS.md` first: it
+covers the `SessionStart` hook, the pnpm shim, Docker caveats and the `dev` start sequence.
+
+## Temporary eMudhra CA mitigations — recheck October 23, 2026
+
+On or after **2026-10-23**, recheck the [upstream disclosure](https://emudhra.we-have-a-problem.com/)
+and the certificate stores shipped by our actual base images, runtimes and Stripe SDK.
+If upstream fixes cover every affected path, remove the manual mitigations consistently:
+the `sed` root exclusions and `trust extract` blocklists in Dockerfiles under `server/`,
+`dev/docker/` and `infra/`, the EC2 host mitigations in `terraform/modules/`
+(e.g. `ec2_tailscale/tailscale-init.sh` and `planetscale_migration/user-data.sh`),
+plus the Stripe workaround that sets
+`stripe_lib.ca_bundle_path = certifi.where()` in `polar.integrations.stripe` before platform
+and merchant migration HTTP clients are constructed. Remove that override only after
+Stripe's own bundle is verified safe for both client paths. Keep patched dependency
+versions and security minimums.
+
+Before removing a mitigation, verify the replacement without that workaround rejects all
+twelve compromised test chains from the disclosure while legitimate, credential-free HTTPS
+connections still succeed. Check build stages, API/workers, Lambda, merchant migration clients,
+Node and EC2 hosts separately; one updated trust store does not establish protection
+for the others.
+If upstream coverage is incomplete, retain the necessary workarounds and update this note
+with the remaining gaps and a new review date. Update regression tests alongside any cleanup.
+Once every workaround has been safely removed, delete this entire temporary section from
+`AGENTS.md` as well.

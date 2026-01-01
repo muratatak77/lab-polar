@@ -1,0 +1,589 @@
+from __future__ import annotations
+
+import builtins
+import typing
+
+from polar.base import (
+    AsyncServiceBase,
+    RequestTimeout,
+    SyncServiceBase,
+    parse_response_json,
+)
+from polar.v2027_01.errors import (
+    CustomerMeterCreditNotReversible,
+    CustomerMetersCredits409Error,
+    HTTPValidationError,
+    NotPermitted,
+    ResourceNotFound,
+)
+from polar.v2027_01.inputs import (
+    CustomerMeterCreditsExternalIDCreate,
+    CustomerMeterCreditsIDCreate,
+)
+from polar.v2027_01.literals import (
+    CustomerMeterSortProperty,
+)
+from polar.v2027_01.outputs import (
+    CustomerMeter,
+    ListResourceCustomerMeter,
+    MeterCreditEvent,
+)
+
+
+class CustomerMetersSync(SyncServiceBase):
+    def list(
+        self,
+        *,
+        organization_id: str | builtins.list[str] | None = None,
+        customer_id: str | builtins.list[str] | None = None,
+        external_customer_id: str | builtins.list[str] | None = None,
+        meter_id: str | builtins.list[str] | None = None,
+        external_meter_id: str | builtins.list[str] | None = None,
+        page: int = 1,
+        limit: int = 10,
+        sorting: builtins.list[CustomerMeterSortProperty] | None = ["-modified_at"],
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> ListResourceCustomerMeter:
+        """
+        List customer meters.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            organization_id: Filter by organization ID.
+            customer_id: Filter by customer ID.
+            external_customer_id: Filter by external customer ID.
+            meter_id: Filter by meter ID.
+            external_meter_id: Filter by meter external ID.
+            page: Page number, defaults to 1.
+            limit: Size of a page, defaults to 10. Maximum is 100.
+            sorting: Sorting criterion. Several criteria can be used simultaneously and will be applied in order. Add a minus sign `-` before the criteria name to sort by descending order.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="GET",
+            url="/v1/customer-meters/",
+            path_params={},
+            query_params={
+                "organization_id": organization_id,
+                "customer_id": customer_id,
+                "external_customer_id": external_customer_id,
+                "meter_id": meter_id,
+                "external_meter_id": external_meter_id,
+                "page": page,
+                "limit": limit,
+                "sorting": sorting,
+            },
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = self.client.send_request(request)
+        method_errors = {
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, ListResourceCustomerMeter, method_errors)
+
+    def iter_list(
+        self,
+        *,
+        organization_id: str | builtins.list[str] | None = None,
+        customer_id: str | builtins.list[str] | None = None,
+        external_customer_id: str | builtins.list[str] | None = None,
+        meter_id: str | builtins.list[str] | None = None,
+        external_meter_id: str | builtins.list[str] | None = None,
+        page: int = 1,
+        limit: int = 10,
+        sorting: builtins.list[CustomerMeterSortProperty] | None = ["-modified_at"],
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> typing.Generator[CustomerMeter, None, None]:
+        """
+        List customer meters.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            organization_id: Filter by organization ID.
+            customer_id: Filter by customer ID.
+            external_customer_id: Filter by external customer ID.
+            meter_id: Filter by meter ID.
+            external_meter_id: Filter by meter external ID.
+            page: Page number, defaults to 1.
+            limit: Size of a page, defaults to 10. Maximum is 100.
+            sorting: Sorting criterion. Several criteria can be used simultaneously and will be applied in order. Add a minus sign `-` before the criteria name to sort by descending order.
+            request_timeout: Timeout override for each request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for each request.
+
+
+        Returns:
+            A generator that yields items of type CustomerMeter.
+
+        Raises:
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        while True:
+            response = self.list(
+                organization_id=organization_id,
+                customer_id=customer_id,
+                external_customer_id=external_customer_id,
+                meter_id=meter_id,
+                external_meter_id=external_meter_id,
+                page=page,
+                limit=limit,
+                sorting=sorting,
+                request_timeout=request_timeout,
+                request_access_token=request_access_token,
+            )
+            yield from response.items
+            if page >= response.pagination.max_page:
+                break
+            page += 1
+
+    def get(
+        self,
+        id: str,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> CustomerMeter:
+        """
+        Get a customer meter by ID.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            id: The customer meter ID.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            ResourceNotFound: Customer meter not found.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="GET",
+            url="/v1/customer-meters/{id}",
+            path_params={
+                "id": id,
+            },
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = self.client.send_request(request)
+        method_errors = {
+            404: ResourceNotFound,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, CustomerMeter, method_errors)
+
+    @typing.overload
+    def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Unpack[CustomerMeterCreditsIDCreate],
+    ) -> MeterCreditEvent: ...
+
+    @typing.overload
+    def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Unpack[CustomerMeterCreditsExternalIDCreate],
+    ) -> MeterCreditEvent: ...
+
+    def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Any,
+    ) -> MeterCreditEvent:
+        """
+        Manually grant credits on a customer meter.
+
+        Returns the `meter.credited` event. The customer meter balance is updated
+        before the response is returned, unless the meter is being updated
+        concurrently, in which case it catches up shortly after.
+
+        **Scopes**: `customers:write`
+
+        Args:
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+            **kwargs: Request body parameters
+
+        Raises:
+            NotPermitted: You don't have permission to manage customers.
+            CustomerMetersCredits409Error: The external_id is already used by a different event, or the external customer ID matches customers in several accessible organizations.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="POST",
+            url="/v1/customer-meters/credits",
+            path_params={},
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+            body=kwargs,
+        )
+        response = self.client.send_request(request)
+        method_errors = {
+            403: NotPermitted,
+            409: CustomerMetersCredits409Error,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, MeterCreditEvent, method_errors)
+
+    def reverse_credit(
+        self,
+        id: str,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> MeterCreditEvent:
+        """
+        Reverse a manual credit, removing the units the customer hasn't used yet.
+
+        Works once per credit, within 7 days and in the current billing period.
+        Returns a `meter.credited` event with negative units and
+        `parent_id` set to the reversed credit.
+
+        **Scopes**: `customers:write`
+
+        Args:
+            id: The ID of the `meter.credited` event returned when the credit was granted.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            NotPermitted: You don't have permission to manage customers.
+            ResourceNotFound: Manual credit not found.
+            CustomerMeterCreditNotReversible: The credit can't be reversed, or the customer meter is being updated: retry shortly.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="POST",
+            url="/v1/customer-meters/credits/{id}/reverse",
+            path_params={
+                "id": id,
+            },
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = self.client.send_request(request)
+        method_errors = {
+            403: NotPermitted,
+            404: ResourceNotFound,
+            409: CustomerMeterCreditNotReversible,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, MeterCreditEvent, method_errors)
+
+
+class CustomerMetersAsync(AsyncServiceBase):
+    async def list(
+        self,
+        *,
+        organization_id: str | builtins.list[str] | None = None,
+        customer_id: str | builtins.list[str] | None = None,
+        external_customer_id: str | builtins.list[str] | None = None,
+        meter_id: str | builtins.list[str] | None = None,
+        external_meter_id: str | builtins.list[str] | None = None,
+        page: int = 1,
+        limit: int = 10,
+        sorting: builtins.list[CustomerMeterSortProperty] | None = ["-modified_at"],
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> ListResourceCustomerMeter:
+        """
+        List customer meters.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            organization_id: Filter by organization ID.
+            customer_id: Filter by customer ID.
+            external_customer_id: Filter by external customer ID.
+            meter_id: Filter by meter ID.
+            external_meter_id: Filter by meter external ID.
+            page: Page number, defaults to 1.
+            limit: Size of a page, defaults to 10. Maximum is 100.
+            sorting: Sorting criterion. Several criteria can be used simultaneously and will be applied in order. Add a minus sign `-` before the criteria name to sort by descending order.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="GET",
+            url="/v1/customer-meters/",
+            path_params={},
+            query_params={
+                "organization_id": organization_id,
+                "customer_id": customer_id,
+                "external_customer_id": external_customer_id,
+                "meter_id": meter_id,
+                "external_meter_id": external_meter_id,
+                "page": page,
+                "limit": limit,
+                "sorting": sorting,
+            },
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = await self.client.send_request(request)
+        method_errors = {
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, ListResourceCustomerMeter, method_errors)
+
+    async def iter_list(
+        self,
+        *,
+        organization_id: str | builtins.list[str] | None = None,
+        customer_id: str | builtins.list[str] | None = None,
+        external_customer_id: str | builtins.list[str] | None = None,
+        meter_id: str | builtins.list[str] | None = None,
+        external_meter_id: str | builtins.list[str] | None = None,
+        page: int = 1,
+        limit: int = 10,
+        sorting: builtins.list[CustomerMeterSortProperty] | None = ["-modified_at"],
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> typing.AsyncGenerator[CustomerMeter, None]:
+        """
+        List customer meters.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            organization_id: Filter by organization ID.
+            customer_id: Filter by customer ID.
+            external_customer_id: Filter by external customer ID.
+            meter_id: Filter by meter ID.
+            external_meter_id: Filter by meter external ID.
+            page: Page number, defaults to 1.
+            limit: Size of a page, defaults to 10. Maximum is 100.
+            sorting: Sorting criterion. Several criteria can be used simultaneously and will be applied in order. Add a minus sign `-` before the criteria name to sort by descending order.
+            request_timeout: Timeout override for each request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for each request.
+
+
+        Returns:
+            An async generator that yields items of type CustomerMeter.
+
+        Raises:
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        while True:
+            response = await self.list(
+                organization_id=organization_id,
+                customer_id=customer_id,
+                external_customer_id=external_customer_id,
+                meter_id=meter_id,
+                external_meter_id=external_meter_id,
+                page=page,
+                limit=limit,
+                sorting=sorting,
+                request_timeout=request_timeout,
+                request_access_token=request_access_token,
+            )
+            for item in response.items:
+                yield item
+            if page >= response.pagination.max_page:
+                break
+            page += 1
+
+    async def get(
+        self,
+        id: str,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> CustomerMeter:
+        """
+        Get a customer meter by ID.
+
+        **Scopes**: `customer_meters:read`
+
+        Args:
+            id: The customer meter ID.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            ResourceNotFound: Customer meter not found.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="GET",
+            url="/v1/customer-meters/{id}",
+            path_params={
+                "id": id,
+            },
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = await self.client.send_request(request)
+        method_errors = {
+            404: ResourceNotFound,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, CustomerMeter, method_errors)
+
+    @typing.overload
+    async def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Unpack[CustomerMeterCreditsIDCreate],
+    ) -> MeterCreditEvent: ...
+
+    @typing.overload
+    async def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Unpack[CustomerMeterCreditsExternalIDCreate],
+    ) -> MeterCreditEvent: ...
+
+    async def credits(
+        self,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+        **kwargs: typing.Any,
+    ) -> MeterCreditEvent:
+        """
+        Manually grant credits on a customer meter.
+
+        Returns the `meter.credited` event. The customer meter balance is updated
+        before the response is returned, unless the meter is being updated
+        concurrently, in which case it catches up shortly after.
+
+        **Scopes**: `customers:write`
+
+        Args:
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+            **kwargs: Request body parameters
+
+        Raises:
+            NotPermitted: You don't have permission to manage customers.
+            CustomerMetersCredits409Error: The external_id is already used by a different event, or the external customer ID matches customers in several accessible organizations.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="POST",
+            url="/v1/customer-meters/credits",
+            path_params={},
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+            body=kwargs,
+        )
+        response = await self.client.send_request(request)
+        method_errors = {
+            403: NotPermitted,
+            409: CustomerMetersCredits409Error,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, MeterCreditEvent, method_errors)
+
+    async def reverse_credit(
+        self,
+        id: str,
+        *,
+        request_timeout: RequestTimeout | None = None,
+        request_access_token: str | None = None,
+    ) -> MeterCreditEvent:
+        """
+        Reverse a manual credit, removing the units the customer hasn't used yet.
+
+        Works once per credit, within 7 days and in the current billing period.
+        Returns a `meter.credited` event with negative units and
+        `parent_id` set to the reversed credit.
+
+        **Scopes**: `customers:write`
+
+        Args:
+            id: The ID of the `meter.credited` event returned when the credit was granted.
+            request_timeout: Timeout override for this request, in seconds or as an httpx.Timeout instance.
+            request_access_token: Access token override for this request.
+
+
+        Raises:
+            NotPermitted: You don't have permission to manage customers.
+            ResourceNotFound: Manual credit not found.
+            CustomerMeterCreditNotReversible: The credit can't be reversed, or the customer meter is being updated: retry shortly.
+            HTTPValidationError: Validation Error
+            PolarNetworkError: Raised when a network error occurs while making the request.
+            PolarRateLimitError: Raised when the rate limit is exceeded.
+            PolarServerError: Raised when the server returns a 5xx error response.
+        """
+        request = self.client.build_request(
+            method="POST",
+            url="/v1/customer-meters/credits/{id}/reverse",
+            path_params={
+                "id": id,
+            },
+            query_params={},
+            request_timeout=request_timeout,
+            request_access_token=request_access_token,
+        )
+        response = await self.client.send_request(request)
+        method_errors = {
+            403: NotPermitted,
+            404: ResourceNotFound,
+            409: CustomerMeterCreditNotReversible,
+            422: HTTPValidationError,
+        }
+        return parse_response_json(response, MeterCreditEvent, method_errors)

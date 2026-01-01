@@ -1,0 +1,39 @@
+// Generated from subscriptions:revoke (2026-10). Do not edit.
+import { Effect } from 'effect'
+import { Argument, Command } from 'effect/cli'
+import { ApiRuntime } from '../runtime'
+import { confirm, fields } from '../inputs'
+
+export const command = Command.make(
+  'revoke',
+  {
+    confirm,
+    fields,
+    path: {
+      id: Argument.String('id'),
+    },
+  },
+  (config) =>
+    Effect.gen(function* () {
+      const api = yield* ApiRuntime
+      yield* api.execute({
+        operationId: 'subscriptions:revoke',
+        method: 'DELETE',
+        requiresConfirmation: true,
+        confirm: config.confirm,
+        fields: config.fields,
+        preview: {
+          fields: [
+            { key: 'id', label: 'ID' },
+            { key: 'status', label: 'Status' },
+            { key: 'customer_id', label: 'Customer ID' },
+            { key: 'product_id', label: 'Product ID' },
+          ],
+          invoke: (client) => client.subscriptions.get(config.path.id),
+        },
+        invoke: (client) => client.subscriptions.revoke(config.path.id),
+      })
+    }),
+).pipe(
+  Command.withDescription('Revoke a subscription, i.e cancel immediately.'),
+)

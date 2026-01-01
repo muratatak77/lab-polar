@@ -1,0 +1,209 @@
+from collections.abc import AsyncGenerator, Sequence
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from pydantic import AfterValidator, AwareDatetime, Field
+from sqlalchemy.orm import joinedload, selectinload
+
+from polar.auth.models import AuthSubject, Organization, User
+from polar.kit.csv import IterableCSVWriter
+from polar.kit.db.postgres import AsyncReadSession
+from polar.kit.schemas import MultipleQueryFilter
+from polar.kit.versioning import QuerySchema, Version
+from polar.models import Order, Product
+from polar.models.order import OrderBillingReasonInternal, OrderStatus
+from polar.organization.schemas import OrganizationID
+from polar.product.schemas import ProductID
+from polar.version import V2027_01
+
+from .repository import OrderRepository
+
+
+class OrderExportColumn(StrEnum):
+    email = "email"
+    created_at = "created_at"
+    product = "product"
+    net_amount = "net_amount"
+    currency = "currency"
+    status = "status"
+    invoice_number = "invoice_number"
+    customer_name = "customer_name"
+    billing_name = "billing_name"
+    billing_country = "billing_country"
+    subtotal_amount = "subtotal_amount"
+    discount_amount = "discount_amount"
+    tax_amount = "tax_amount"
+    total_amount = "total_amount"
+    refunded_amount = "refunded_amount"
+    billing_reason = "billing_reason"
+
+
+ORDER_EXPORT_HEADERS: dict[OrderExportColumn, str] = {
+    OrderExportColumn.email: "Email",
+    OrderExportColumn.created_at: "Created At",
+    OrderExportColumn.product: "Product",
+    OrderExportColumn.net_amount: "Net Amount",
+    OrderExportColumn.currency: "Currency",
+    OrderExportColumn.status: "Status",
+    OrderExportColumn.invoice_number: "Invoice number",
+    OrderExportColumn.customer_name: "Customer Name",
+    OrderExportColumn.billing_name: "Billing Name",
+    OrderExportColumn.billing_country: "Billing Country",
+    OrderExportColumn.subtotal_amount: "Subtotal",
+    OrderExportColumn.discount_amount: "Discount",
+    OrderExportColumn.tax_amount: "Tax",
+    OrderExportColumn.total_amount: "Total",
+    OrderExportColumn.refunded_amount: "Refunded Amount",
+    OrderExportColumn.billing_reason: "Billing Reason",
+}
+
+ORDER_EXPORT_DEFAULT_COLUMNS: list[OrderExportColumn] = [
+    OrderExportColumn.email,
+    OrderExportColumn.created_at,
+    OrderExportColumn.product,
+    OrderExportColumn.net_amount,
+    OrderExportColumn.currency,
+    OrderExportColumn.status,
+    OrderExportColumn.invoice_number,
+]
+
+
+def _validate_timezone(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except ValueError, ZoneInfoNotFoundError:
+        raise ValueError(f"{value!r} is not a valid IANA time zone") from None
+    return value
+
+
+# Kept as a plain string rather than an enum of every IANA zone: the generated
+# TypeScript client inlines such an enum at every use site, adding ~1200 lines.
+OrderExportTimezone = Annotated[str, AfterValidator(_validate_timezone)]
+
+
+def _row(order: Order, tz: ZoneInfo) -> dict[OrderExportColumn, str | float | None]:
+    return {
+        OrderExportColumn.email: order.customer.email,
+        OrderExportColumn.created_at: order.created_at.astimezone(tz).isoformat(),
+        OrderExportColumn.product: order.description,
+        OrderExportColumn.net_amount: order.net_amount / 100,
+        OrderExportColumn.currency: order.currency,
+        OrderExportColumn.status: order.status,
+        OrderExportColumn.invoice_number: order.invoice_number,
+        OrderExportColumn.customer_name: order.customer.name,
+        OrderExportColumn.billing_name: order.billing_name,
+        OrderExportColumn.billing_country: (
+            order.billing_address.country if order.billing_address else None
+        ),
+        OrderExportColumn.subtotal_amount: order.subtotal_amount / 100,
+        OrderExportColumn.discount_amount: order.discount_amount / 100,
+        OrderExportColumn.tax_amount: order.tax_amount / 100,
+        OrderExportColumn.total_amount: order.total_amount / 100,
+        OrderExportColumn.refunded_amount: order.refunded_amount / 100,
+        OrderExportColumn.billing_reason: OrderBillingReasonInternal.to_public(
+            order.billing_reason
+        ),
+    }
+
+
+def get_filename(
+    created_after: datetime | None,
+    created_before: datetime | None,
+    timezone: ZoneInfo,
+) -> str:
+    filename = "polar-orders"
+    for bound in (created_after, created_before):
+        if bound is not None:
+            filename += f"-{bound.astimezone(timezone).strftime('%Y-%m-%d')}"
+    return f"{filename}.csv"
+
+
+async def generate_csv(
+    session: AsyncReadSession,
+    auth_subject: AuthSubject[User | Organization],
+    *,
+    organization_id: Sequence[OrganizationID] | None,
+    product_id: Sequence[ProductID] | None,
+    external_product_id: Sequence[str] | None = None,
+    status: Sequence[OrderStatus] | None,
+    created_after: datetime | None,
+    created_before: datetime | None,
+    timezone: ZoneInfo,
+    columns: Sequence[OrderExportColumn] | None,
+) -> AsyncGenerator[str]:
+    export_columns = columns or ORDER_EXPORT_DEFAULT_COLUMNS
+
+    csv_writer = IterableCSVWriter(dialect="excel")
+    yield csv_writer.getrow(
+        tuple(ORDER_EXPORT_HEADERS[column] for column in export_columns)
+    )
+
+    repository = OrderRepository.from_session(session)
+    statement = repository.get_readable_statement(auth_subject).options(
+        joinedload(Order.customer),
+        joinedload(Order.product),
+        selectinload(Order.items),
+    )
+    if organization_id is not None:
+        statement = statement.where(Order.organization_id.in_(organization_id))
+    if product_id is not None:
+        statement = statement.where(Order.product_id.in_(product_id))
+    if external_product_id is not None:
+        statement = statement.where(
+            Order.product.has(Product.external_id.in_(external_product_id))
+        )
+    if status is not None:
+        statement = statement.where(Order.status.in_(status))
+    if created_after is not None:
+        statement = statement.where(Order.created_at > created_after)
+    if created_before is not None:
+        statement = statement.where(Order.created_at < created_before)
+    statement = statement.order_by(Order.created_at.desc())
+
+    async for order in repository.stream(statement):
+        row = _row(order, timezone)
+        yield csv_writer.getrow(tuple(row[column] for column in export_columns))
+
+
+class OrderExportParams(QuerySchema):
+    organization_id: MultipleQueryFilter[OrganizationID] | None = Field(
+        None, title="OrganizationID Filter", description="Filter by organization ID."
+    )
+    product_id: MultipleQueryFilter[ProductID] | None = Field(
+        None, title="ProductID Filter", description="Filter by product ID."
+    )
+    external_product_id: Annotated[
+        MultipleQueryFilter[str] | None, Version(starting_from=V2027_01)
+    ] = Field(
+        None,
+        title="ExternalProductID Filter",
+        description="Filter by product external ID.",
+    )
+    status: MultipleQueryFilter[OrderStatus] | None = Field(
+        None, title="Status Filter", description="Filter by order status."
+    )
+    created_after: AwareDatetime | None = Field(
+        None,
+        description=(
+            "Only include orders created after this date. Must include a UTC offset."
+        ),
+    )
+    created_before: AwareDatetime | None = Field(
+        None,
+        description=(
+            "Only include orders created before this date. Must include a UTC offset."
+        ),
+    )
+    timezone: OrderExportTimezone = Field(
+        "UTC", description="Time zone used to render dates in the CSV."
+    )
+    columns: MultipleQueryFilter[OrderExportColumn] | None = Field(
+        None,
+        description=(
+            "Columns to include in the CSV, in order. "
+            "Defaults to email, created_at, product, net_amount, "
+            "currency, status and invoice_number."
+        ),
+    )

@@ -1,0 +1,42 @@
+// Generated from customer-seats:list_seats (2026-10). Do not edit.
+import type { Polar } from '@polar-sh/sdk/2026-10'
+import { Effect } from 'effect'
+import { Command, Flag } from 'effect/cli'
+import { ApiRuntime } from '../runtime'
+import { fields, data, mergeInput, nullableStringFlag } from '../inputs'
+
+type Query = NonNullable<Parameters<Polar['customerSeats']['listSeats']>[0]>
+
+export const command = Command.make(
+  'list_seats',
+  {
+    fields,
+    data,
+    input: {
+      subscription_id: nullableStringFlag('subscription-id').pipe(
+        Flag.optional,
+        Flag.withDescription('subscription_id'),
+      ),
+      order_id: nullableStringFlag('order-id').pipe(
+        Flag.optional,
+        Flag.withDescription('order_id'),
+      ),
+    },
+  },
+  (config) =>
+    Effect.gen(function* () {
+      const api = yield* ApiRuntime
+      const query = mergeInput<Query>(config.data, {
+        subscription_id: config.input.subscription_id,
+        order_id: config.input.order_id,
+      })
+      yield* api.execute({
+        operationId: 'customer-seats:list_seats',
+        method: 'GET',
+        requiresConfirmation: false,
+        confirm: false,
+        fields: config.fields,
+        invoke: (client) => client.customerSeats.listSeats(query),
+      })
+    }),
+).pipe(Command.withDescription('List seats for a subscription or order.'))

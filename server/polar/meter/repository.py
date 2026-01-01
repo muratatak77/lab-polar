@@ -1,0 +1,85 @@
+from collections.abc import Sequence
+from uuid import UUID
+
+from sqlalchemy import Select, exists, select
+from sqlalchemy.orm import undefer
+
+from polar.authz.types import AccessibleOrganizationID
+from polar.kit.repository import (
+    RepositoryBase,
+    RepositoryExternalIDMixin,
+    RepositoryIDMixin,
+)
+from polar.models import Meter, ProductPrice, Subscription, SubscriptionProductPrice
+from polar.models.subscription import SubscriptionStatus
+
+
+class MeterRepository(
+    RepositoryExternalIDMixin[Meter],
+    RepositoryBase[Meter],
+    RepositoryIDMixin[Meter, UUID],
+):
+    model = Meter
+
+    def get_statement_by_org_ids(
+        self, org_ids: set[AccessibleOrganizationID]
+    ) -> Select[Meter]:
+        return self.get_base_statement().where(Meter.organization_id.in_(org_ids))
+
+    async def get_readable_by_id(
+        self,
+        id: UUID,
+        org_ids: set[AccessibleOrganizationID],
+    ) -> Meter | None:
+        statement = self.get_statement_by_org_ids(org_ids).where(Meter.id == id)
+        return await self.get_one_or_none(statement)
+
+    async def get_all_by_external_ids(
+        self,
+        organization_id: UUID,
+        external_ids: Sequence[str],
+        *,
+        for_update: bool = False,
+    ) -> Sequence[Meter]:
+        statement = (
+            self.get_base_statement()
+            .where(
+                Meter.organization_id == organization_id,
+                Meter.external_id.in_(external_ids),
+                Meter.deleted_at.is_(None),
+            )
+            .options(undefer(Meter.external_id))
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await self.get_all(statement)
+
+    def get_organization_statement(self, organization_id: UUID) -> Select[Meter]:
+        return (
+            self.get_base_statement()
+            .where(
+                Meter.organization_id == organization_id,
+                Meter.deleted_at.is_(None),
+            )
+            .order_by(Meter.created_at, Meter.id)
+            .options(undefer(Meter.external_id))
+        )
+
+    async def has_billable_subscriptions(self, meter_id: UUID) -> bool:
+        statement = select(
+            exists()
+            .where(
+                SubscriptionProductPrice.subscription_id == Subscription.id,
+                ProductPrice.id == SubscriptionProductPrice.product_price_id,
+            )
+            .where(
+                ProductPrice.is_metered,
+                # The subclass attribute would add a polymorphic filter and drop tiered prices.
+                ProductPrice.__table__.c.meter_id == meter_id,
+                Subscription.status.in_(SubscriptionStatus.billable_statuses()),
+                ~Subscription.is_deleted,
+                ~SubscriptionProductPrice.is_deleted,
+            )
+        )
+        result = await self.session.execute(statement)
+        return result.scalar_one()

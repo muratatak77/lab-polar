@@ -1,0 +1,43 @@
+{
+  "name": "react-email-pkg",
+  "version": "1.0.0",
+  "private": true,
+  "readme": "README.md",
+  "main": "dist/index.js",
+  "bin": "dist/index.js",
+  "scripts": {
+    "dev": "email dev --dir src/emails",
+    "clean": "rm -rf dist bin",
+    "types": "uv --directory .. run python -m polar.email.schemas | openapi-typescript --output src/types/openapi.ts && oxfmt src/types/openapi.ts",
+    "build": "pnpm run clean && tsdown && pkg package.json",
+    "typecheck": "tsc --noEmit",
+    "format": "oxfmt src",
+    "lint": "oxfmt --check src && oxlint ."
+  },
+  "packageManager": "pnpm@12.8.0",
+  "dependencies": {
+    "commander": "^15.0.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-email": "^6.11.4"
+  },
+  "devDependencies": {
+    "@react-email/ui": "^6.11.3",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@yao-pkg/pkg": "^6.24.0",
+    "openapi-typescript": "^7.13.0",
+    "oxfmt": "^0.75.0",
+    "tsdown": "0.23.3",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
+    "oxlint": "^1.89.0",
+    "@typescript/native": "npm:typescript@7.0.2"
+  },
+  "pkg": {
+    "targets": [
+      "host"
+    ],
+    "outputPath": "bin"
+  }
+}

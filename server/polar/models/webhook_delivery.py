@@ -1,0 +1,68 @@
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, Text, Uuid
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
+
+from polar.kit.db.models.base import OrganizationCreatedAtIndexMixin, RecordModel
+
+if TYPE_CHECKING:
+    from .organization import Organization
+    from .webhook_endpoint import WebhookEndpoint
+    from .webhook_event import WebhookEvent
+
+
+class WebhookDelivery(OrganizationCreatedAtIndexMixin, RecordModel):
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (
+        Index(
+            "ix_webhook_deliveries_webhook_endpoint_id_created_at",
+            "webhook_endpoint_id",
+            "created_at",
+        ),
+        {
+            "postgresql_with": {
+                "autovacuum_vacuum_threshold": 100000,
+                "autovacuum_vacuum_scale_factor": 0,
+                "autovacuum_vacuum_insert_threshold": 200000,
+                "autovacuum_vacuum_insert_scale_factor": 0,
+                "autovacuum_analyze_threshold": 250000,
+                "autovacuum_analyze_scale_factor": 0,
+            }
+        },
+    )
+
+    webhook_endpoint_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("webhook_endpoints.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    @declared_attr
+    def webhook_endpoint(cls) -> Mapped["WebhookEndpoint"]:
+        return relationship("WebhookEndpoint", lazy="raise")
+
+    organization_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    @declared_attr
+    def organization(cls) -> Mapped["Organization"]:
+        return relationship("Organization", lazy="raise")
+
+    webhook_event_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("webhook_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    @declared_attr
+    def webhook_event(cls) -> Mapped["WebhookEvent"]:
+        return relationship("WebhookEvent", lazy="raise")
+
+    succeeded: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    http_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response: Mapped[str | None] = mapped_column(Text, nullable=True)

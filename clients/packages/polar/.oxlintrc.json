@@ -1,0 +1,36 @@
+{
+  "$schema": "../../node_modules/oxlint/configuration_schema.json",
+  "ignorePatterns": ["node_modules/**", "dist/**"],
+  "extends": ["../oxlint-config/oxlint-base.json"],
+  "plugins": ["typescript", "import", "oxc"],
+  "jsPlugins": ["./lint/polar.ts"],
+  "rules": {
+    "import/no-cycle": "error",
+    "oxc/no-barrel-file": ["error", { "threshold": 0 }],
+    "polar-sdk/client-boundaries": "error",
+    "polar-sdk/internal-boundaries": "error",
+    "polar-sdk/no-internal-leak": "error",
+    "polar-sdk/no-terminal-output": "error",
+    "polar-sdk/schema-is-pure": "error",
+    "polar-sdk/test-colocation": "error",
+    "no-restricted-imports": [
+      "error",
+      {
+        "patterns": [
+          {
+            "group": ["@polar-sh/sdk", "@polar-sh/sdk/*"],
+            "message": "Only src/sdk.ts may depend on @polar-sh/sdk. It pins the API version in one place."
+          }
+        ]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/sdk.ts"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    }
+  ]
+}

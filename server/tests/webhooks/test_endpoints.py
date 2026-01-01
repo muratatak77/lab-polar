@@ -1,0 +1,434 @@
+import pytest
+from httpx import AsyncClient
+
+from polar.auth.scope import Scope
+from polar.models import User
+from polar.models.organization import Organization
+from polar.models.user_organization import OrganizationRole, UserOrganization
+from polar.models.webhook_delivery import WebhookDelivery
+from polar.models.webhook_endpoint import WebhookEndpoint
+from polar.version import V2026_04, V2026_10, V2027_01
+from tests.fixtures.auth import AuthSubjectFixture
+from tests.fixtures.database import SaveFixture
+from tests.fixtures.random_objects import create_webhook_endpoint
+
+
+@pytest.mark.anyio
+class TestListWebhookEndpoints:
+    async def test_unauthenticated(
+        self,
+        client: AsyncClient,
+        organization: Organization,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        params = {"organization_id": str(organization.id)}
+        response = await client.get("/v1/webhooks/endpoints", params=params)
+        assert response.status_code == 401
+
+    @pytest.mark.auth
+    async def test_authenticated_not_member(
+        self,
+        client: AsyncClient,
+        organization: Organization,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        params = {"organization_id": str(organization.id)}
+        response = await client.get("/v1/webhooks/endpoints", params=params)
+
+        assert response.status_code == 200
+        json = response.json()
+        assert len(json["items"]) == 0
+
+    @pytest.mark.auth
+    async def test_authenticated(
+        self,
+        client: AsyncClient,
+        organization: Organization,
+        user: User,
+        user_organization: UserOrganization,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        params = {"organization_id": str(organization.id)}
+        response = await client.get("/v1/webhooks/endpoints", params=params)
+
+        assert response.status_code == 200
+        json = response.json()
+        assert len(json["items"]) == 1
+        assert json["items"][0]["id"] == str(webhook_endpoint_organization.id)
+
+
+@pytest.mark.anyio
+class TestGetExternalWebhookEndpoint:
+    @pytest.mark.api_version(V2027_01)
+    @pytest.mark.auth
+    async def test_valid(
+        self,
+        save_fixture: SaveFixture,
+        client: AsyncClient,
+        user_organization: UserOrganization,
+        organization: Organization,
+    ) -> None:
+        endpoint = await create_webhook_endpoint(
+            save_fixture, organization=organization, external_id="app"
+        )
+
+        response = await client.get("/v1/webhooks/endpoints/external/app")
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["id"] == str(endpoint.id)
+        assert json["external_id"] == "app"
+        assert json["secret"] == "SECRET"
+
+    @pytest.mark.api_version(V2027_01)
+    @pytest.mark.auth
+    async def test_other_organization(
+        self,
+        save_fixture: SaveFixture,
+        client: AsyncClient,
+        user_organization: UserOrganization,
+        organization_second: Organization,
+    ) -> None:
+        await create_webhook_endpoint(
+            save_fixture, organization=organization_second, external_id="app"
+        )
+
+        response = await client.get("/v1/webhooks/endpoints/external/app")
+
+        assert response.status_code == 404
+
+    @pytest.mark.api_version(V2027_01)
+    @pytest.mark.auth
+    async def test_ambiguous_across_organizations(
+        self,
+        save_fixture: SaveFixture,
+        client: AsyncClient,
+        user: User,
+        user_organization: UserOrganization,
+        organization: Organization,
+        organization_second: Organization,
+    ) -> None:
+        await save_fixture(
+            UserOrganization(
+                user=user, organization=organization_second, role=OrganizationRole.admin
+            )
+        )
+        for org in (organization, organization_second):
+            await create_webhook_endpoint(
+                save_fixture, organization=org, external_id="app"
+            )
+
+        response = await client.get("/v1/webhooks/endpoints/external/app")
+
+        assert response.status_code == 409
+
+    @pytest.mark.api_version(V2026_04, V2026_10)
+    @pytest.mark.auth
+    async def test_not_available_before_2027_01(
+        self,
+        save_fixture: SaveFixture,
+        client: AsyncClient,
+        user_organization: UserOrganization,
+        organization: Organization,
+    ) -> None:
+        await create_webhook_endpoint(
+            save_fixture, organization=organization, external_id="app"
+        )
+
+        response = await client.get("/v1/webhooks/endpoints/external/app")
+
+        assert response.status_code == 404
+
+
+@pytest.mark.anyio
+class TestCreateWebhookEndpoint:
+    @pytest.mark.auth(AuthSubjectFixture(scopes=set()))
+    async def test_user_missing_scope(self, client: AsyncClient) -> None:
+        params = {"url": "https://example.com/hook", "format": "raw", "events": []}
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(scopes={Scope.webhooks_write}),
+    )
+    async def test_user_valid(
+        self,
+        client: AsyncClient,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        params = {
+            "url": "https://example.com/hook",
+            "format": "raw",
+            "events": [],
+            "organization_id": str(organization.id),
+        }
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 201
+
+    @pytest.mark.auth(AuthSubjectFixture(subject="organization", scopes=set()))
+    async def test_organization_missing_scope(self, client: AsyncClient) -> None:
+        params = {"url": "https://example.com/hook", "format": "raw", "events": []}
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_organization_valid_creator_webhooks_write_scope(
+        self, client: AsyncClient
+    ) -> None:
+        params = {"url": "https://example.com/hook", "format": "raw", "events": []}
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 201
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(scopes={Scope.webhooks_write}),
+    )
+    async def test_url_with_leading_and_trailing_spaces(
+        self,
+        client: AsyncClient,
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        params = {
+            "url": "  https://example.com/hook  ",
+            "format": "raw",
+            "events": [],
+            "organization_id": str(organization.id),
+        }
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 201
+        json = response.json()
+        assert json["url"] == "https://example.com/hook"
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2026_04)
+    async def test_2026_04_accepts_deprecated_secret(self, client: AsyncClient) -> None:
+        custom_secret = "whsec_ovyN6cPrTv56AApvzCaJno08SSmGJmgbWilb33N2JuK"
+        params = {
+            "url": "https://example.com/hook",
+            "format": "raw",
+            "events": [],
+            "secret": custom_secret,
+        }
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 201
+        assert response.json()["secret"] == custom_secret
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2026_10)
+    async def test_2026_10_ignores_deprecated_secret(self, client: AsyncClient) -> None:
+        custom_secret = "whsec_ovyN6cPrTv56AApvzCaJno08SSmGJmgbWilb33N2JuK"
+        params = {
+            "url": "https://example.com/hook",
+            "format": "raw",
+            "events": [],
+            "secret": custom_secret,
+        }
+        response = await client.post("/v1/webhooks/endpoints", json=params)
+
+        assert response.status_code == 201
+        assert response.json()["secret"] != custom_secret
+        assert response.json()["secret"].startswith("whsec_")
+
+
+@pytest.mark.anyio
+class TestUpdateWebhookEndpoint:
+    @pytest.mark.auth(AuthSubjectFixture(scopes=set()))
+    async def test_user_missing_scope(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        user_organization: UserOrganization,
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}", json={}
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(scopes={Scope.webhooks_write}),
+    )
+    async def test_user_valid(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        user_organization: UserOrganization,
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}", json={}
+        )
+
+        assert response.status_code == 200
+
+    @pytest.mark.auth(AuthSubjectFixture(subject="organization", scopes=set()))
+    async def test_organization_missing_scope(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}", json={}
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_organization_valid_creator_webhooks_write_scope(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}", json={}
+        )
+
+        assert response.status_code == 200
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2026_04)
+    async def test_2026_04_accepts_deprecated_secret(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        custom_secret = "whsec_ovyN6cPrTv56AApvzCaJno08SSmGJmgbWilb33N2JuK"
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}",
+            json={"secret": custom_secret},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["secret"] == custom_secret
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2026_10)
+    async def test_2026_10_ignores_deprecated_secret(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        old_secret = webhook_endpoint_organization.secret
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}",
+            json={
+                "secret": "whsec_ovyN6cPrTv56AApvzCaJno08SSmGJmgbWilb33N2JuK",
+                "url": "https://example.com/hook-updated",
+            },
+        )
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["secret"] == old_secret
+        assert json["url"] == "https://example.com/hook-updated"
+
+
+@pytest.mark.anyio
+class TestDeleteWebhookEndpoint:
+    @pytest.mark.auth(AuthSubjectFixture(scopes=set()))
+    async def test_user_missing_scope(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        user_organization: UserOrganization,
+    ) -> None:
+        response = await client.delete(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}"
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(scopes={Scope.webhooks_write}),
+    )
+    async def test_user_valid(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        user_organization: UserOrganization,
+    ) -> None:
+        response = await client.delete(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}"
+        )
+
+        assert response.status_code == 204
+
+    @pytest.mark.auth(AuthSubjectFixture(subject="organization", scopes=set()))
+    async def test_organization_missing_scope(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.delete(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}"
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_organization_valid_creator_webhooks_write_scope(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.delete(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}"
+        )
+
+        assert response.status_code == 204
+
+
+@pytest.mark.anyio
+class TestListWebhookDeliveries:
+    @pytest.mark.auth
+    async def test_user_not_member(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        webhook_delivery: WebhookDelivery,
+    ) -> None:
+        response = await client.get("/v1/webhooks/deliveries")
+
+        assert response.status_code == 200
+        json = response.json()
+        assert len(json["items"]) == 0
+
+    @pytest.mark.auth
+    async def test_user(
+        self,
+        client: AsyncClient,
+        user: User,
+        webhook_endpoint_organization: WebhookEndpoint,
+        webhook_delivery: WebhookDelivery,
+        user_organization: UserOrganization,
+    ) -> None:
+        response = await client.get("/v1/webhooks/deliveries")
+
+        assert response.status_code == 200
+        json = response.json()
+        assert len(json["items"]) == 1
+        assert json["items"][0]["id"] == str(webhook_delivery.id)
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_organization(
+        self,
+        client: AsyncClient,
+        webhook_endpoint_organization: WebhookEndpoint,
+        webhook_delivery: WebhookDelivery,
+    ) -> None:
+        response = await client.get("/v1/webhooks/deliveries")
+
+        assert response.status_code == 200
+        json = response.json()
+        assert len(json["items"]) == 1
+        assert json["items"][0]["id"] == str(webhook_delivery.id)

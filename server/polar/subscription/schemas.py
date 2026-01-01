@@ -1,0 +1,824 @@
+import inspect
+from datetime import datetime
+from typing import Annotated, Literal
+
+from fastapi import Path
+from pydantic import (
+    UUID4,
+    AliasChoices,
+    AliasPath,
+    ConfigDict,
+    Field,
+    FutureDatetime,
+)
+from pydantic.json_schema import SkipJsonSchema
+
+from polar.custom_field.data import CustomFieldDataOutputMixin
+from polar.customer.schemas.customer import CustomerBase, CustomerID, ExternalCustomerID
+from polar.discount.schemas import DiscountID, DiscountMinimal
+from polar.enums import SubscriptionProrationBehavior, SubscriptionRecurringInterval
+from polar.kit.currency import PresentmentCurrency, format_currency
+from polar.kit.metadata import MetadataInputMixin, MetadataOutputMixin
+from polar.kit.schemas import (
+    CUSTOMER_ID_EXAMPLE,
+    METER_ID_EXAMPLE,
+    PRODUCT_ID_EXAMPLE,
+    IDSchema,
+    Int32,
+    MergeJSONSchema,
+    MultipleQueryFilter,
+    Schema,
+    SetSchemaReference,
+    TimestampedSchema,
+)
+from polar.kit.versioning import QuerySchema, Version, VersionedJsonSchema
+from polar.meter.schemas import Meter
+from polar.models.subscription import CustomerCancellationReason, SubscriptionStatus
+from polar.openapi import destructive_when_equals
+from polar.organization.schemas import OrganizationID
+from polar.product.schemas import Product, ProductID, ProductPrice
+from polar.version import V2026_10, V2027_01
+
+SubscriptionID = Annotated[UUID4, Path(description="The subscription ID.")]
+
+
+class SubscriptionCustomer(CustomerBase): ...
+
+
+class SubscriptionUser(Schema):
+    id: UUID4 = Field(
+        validation_alias=AliasChoices(
+            # Validate from ORM model
+            "legacy_user_id",
+            # Validate from stored webhook payload
+            "id",
+        )
+    )
+    email: str | None = None
+    public_name: str = Field(
+        validation_alias=AliasChoices(
+            # Validate from ORM model
+            "legacy_user_public_name",
+            # Validate from stored webhook payload
+            "public_name",
+        )
+    )
+    avatar_url: str | None = Field(None)
+    github_username: str | None = Field(None)
+
+
+class SubscriptionBase(IDSchema, TimestampedSchema):
+    amount: int = Field(description="The amount of the subscription.", examples=[10000])
+    currency: str = Field(
+        description="The currency of the subscription.", examples=["usd"]
+    )
+    recurring_interval: SubscriptionRecurringInterval = Field(
+        description="The interval at which the subscription recurs.",
+        examples=["month"],
+    )
+    recurring_interval_count: int = Field(
+        description=(
+            "Number of interval units of the subscription. "
+            "If this is set to 1 the charge will happen every interval (e.g. every month), "
+            "if set to 2 it will be every other month, and so on."
+        )
+    )
+    status: SubscriptionStatus = Field(
+        description="The status of the subscription.", examples=["active"]
+    )
+    current_period_start: datetime = Field(
+        description="The start timestamp of the current billing period."
+    )
+    current_period_end: datetime = Field(
+        description="The end timestamp of the current billing period."
+    )
+    current_meter_period_start: datetime | None = Field(
+        description=(
+            "The start timestamp of the current meter period, if the product has a "
+            "meter cycle set. Metered credits are granted and overage is settled on "
+            "this cadence."
+        ),
+    )
+    current_meter_period_end: datetime | None = Field(
+        description=(
+            "The end timestamp of the current meter period, if the product has a "
+            "meter cycle set. This is when credits next renew."
+        ),
+    )
+    trial_start: datetime | None = Field(
+        description="The start timestamp of the trial period, if any."
+    )
+    trial_end: datetime | None = Field(
+        description="The end timestamp of the trial period, if any."
+    )
+    cancel_at_period_end: bool = Field(
+        description=(
+            "Whether the subscription will be canceled "
+            "at the end of the current period."
+        )
+    )
+    canceled_at: datetime | None = Field(
+        description=(
+            "The timestamp when the subscription was canceled. "
+            "The subscription might still be active if `cancel_at_period_end` is `true`."
+        )
+    )
+    started_at: Annotated[
+        datetime,
+        VersionedJsonSchema(
+            lambda schema: {"anyOf": [schema, {"type": "null"}]},
+            up_to=V2026_10,
+        ),
+    ] = Field(description="The timestamp when the subscription started.")
+    ends_at: datetime | None = Field(
+        description="The timestamp when the subscription will end."
+    )
+    ended_at: datetime | None = Field(
+        description="The timestamp when the subscription ended."
+    )
+    past_due_at: datetime | None = Field(
+        None,
+        description=("The timestamp when the subscription entered `past_due` status."),
+    )
+    pause_at_period_end: bool = Field(
+        description=(
+            "Whether the subscription will be paused at the end of the current period."
+        )
+    )
+    paused_at: datetime | None = Field(
+        description="The timestamp when the subscription was paused.",
+    )
+    resumes_at: datetime | None = Field(
+        description=(
+            "The timestamp when a paused subscription is scheduled to "
+            "automatically resume, if set."
+        ),
+    )
+
+    customer_id: UUID4 = Field(description="The ID of the subscribed customer.")
+    product_id: UUID4 = Field(description="The ID of the subscribed product.")
+    discount_id: UUID4 | None = Field(
+        description="The ID of the applied discount, if any."
+    )
+    checkout_id: UUID4 | None
+
+    seats: int | None = Field(
+        default=None,
+        description="The number of seats for seat-based subscriptions. None for non-seat subscriptions.",
+    )
+    units: int | None = Field(
+        description="The number of units for unit-based subscriptions. None for non-unit subscriptions.",
+    )
+
+    customer_cancellation_reason: CustomerCancellationReason | None
+    customer_cancellation_comment: str | None
+
+    price_id: Annotated[SkipJsonSchema[UUID4], Version(up_to=V2026_10)] = Field(
+        deprecated="Use `prices` instead.",
+        validation_alias=AliasChoices(
+            # Validate from stored webhook payload
+            "price_id",
+            # Validate from ORM model
+            AliasPath("prices", 0, "id"),
+        ),
+    )
+
+    def get_amount_display(self) -> str:
+        if self.amount == 0:
+            return "Free"
+        return (
+            f"{format_currency(self.amount, self.currency)}/{self.recurring_interval}"
+        )
+
+
+SubscriptionDiscount = Annotated[
+    DiscountMinimal, MergeJSONSchema({"title": "SubscriptionDiscount"})
+]
+
+
+class SubscriptionMeterBase(IDSchema, TimestampedSchema):
+    consumed_units: float = Field(
+        description="The number of consumed units so far in this billing period.",
+        examples=[25.0],
+    )
+    credited_units: int = Field(
+        description="The number of credited units so far in this billing period.",
+        examples=[100],
+    )
+    amount: int = Field(
+        description="The amount due in cents so far in this billing period.",
+        examples=[0],
+    )
+    meter_id: UUID4 = Field(
+        description="The ID of the meter.", examples=[METER_ID_EXAMPLE]
+    )
+
+
+class SubscriptionMeter(SubscriptionMeterBase):
+    """Current consumption and spending for a subscription meter."""
+
+    meter: Meter = Field(
+        description="The meter associated with this subscription.",
+    )
+
+
+class PendingSubscriptionUpdate(IDSchema, TimestampedSchema):
+    """Pending update to be applied to a subscription at the beginning of the next period."""
+
+    applies_at: datetime = Field(
+        description="The date and time when the subscription update will be applied."
+    )
+    product_id: UUID4 | None = Field(
+        description="ID of the new product to apply to the subscription. If `null`, the product won't be changed."
+    )
+    seats: int | None = Field(
+        description="Number of seats to apply to the subscription. If `null`, the number of seats won't be changed."
+    )
+    units: int | None = Field(
+        description="Number of units to apply to the subscription. If `null`, the number of units won't be changed."
+    )
+    discount_id: Annotated[
+        UUID4 | None,
+        Version(starting_from=V2027_01),
+        Field(
+            description=(
+                "ID of the new discount to apply to the subscription. "
+                "If `null`, the subscription keeps its current discount."
+            )
+        ),
+    ]
+    discount_unset: Annotated[
+        bool,
+        Version(starting_from=V2027_01),
+        Field(
+            description="Whether the subscription's current discount will be removed."
+        ),
+    ]
+
+
+class Subscription(CustomFieldDataOutputMixin, MetadataOutputMixin, SubscriptionBase):
+    customer: SubscriptionCustomer
+    user_id: Annotated[SkipJsonSchema[UUID4], Version(up_to=V2026_10)] = Field(
+        validation_alias=AliasChoices(
+            # Validate from stored webhook payload
+            "user_id",
+            # Validate from ORM model
+            AliasPath("customer", "legacy_user_id"),
+        ),
+        deprecated="Use `customer_id`.",
+    )
+    user: Annotated[SkipJsonSchema[SubscriptionUser], Version(up_to=V2026_10)] = Field(
+        validation_alias=AliasChoices(
+            # Validate from stored webhook payload
+            "user",
+            # Validate from ORM model
+            "customer",
+        ),
+        deprecated="Use `customer`.",
+    )
+    product: Product
+    discount: SubscriptionDiscount | None
+
+    price: Annotated[SkipJsonSchema[ProductPrice], Version(up_to=V2026_10)] = Field(
+        deprecated="Use `prices` instead.",
+        validation_alias=AliasChoices(
+            # Validate from stored webhook payload
+            "price",
+            # Validate from ORM model
+            AliasPath("prices", 0),
+        ),
+    )
+
+    prices: list[ProductPrice] = Field(
+        description="List of enabled prices for the subscription."
+    )
+    meters: list[SubscriptionMeter] = Field(
+        description="List of meters associated with the subscription."
+    )
+    pending_update: PendingSubscriptionUpdate | None = Field(
+        description=(
+            "Pending subscription update that will be applied at the beginning of the next period. "
+            "If `null`, there is no pending update."
+        )
+    )
+
+
+class SubscriptionCreateBase(MetadataInputMixin, Schema):
+    product_id: UUID4 = Field(
+        description=(
+            "The ID of the recurring product to subscribe to. "
+            "Must be a free product, otherwise the customer should go through a checkout flow."
+        ),
+        examples=[PRODUCT_ID_EXAMPLE],
+    )
+    currency: Annotated[
+        PresentmentCurrency | None,
+        Version(starting_from=V2027_01),
+        Field(
+            description=(
+                "The currency of the subscription. "
+                "The product must have a free price in this currency. "
+                "If not set, the organization's default currency is used."
+            ),
+        ),
+    ] = None
+
+
+class SubscriptionCreateCustomer(SubscriptionCreateBase):
+    """
+    Create a subscription for an existing customer.
+    """
+
+    customer_id: UUID4 = Field(
+        description="The ID of the customer to create the subscription for.",
+        examples=[CUSTOMER_ID_EXAMPLE],
+    )
+
+
+class SubscriptionCreateExternalCustomer(SubscriptionCreateBase):
+    """
+    Create a subscription for an existing customer identified by an external ID.
+    """
+
+    external_customer_id: str = Field(
+        description=(
+            "The ID of the customer in your system to create the subscription for. "
+            "It must already exist in Polar."
+        )
+    )
+
+
+SubscriptionCreate = SubscriptionCreateCustomer | SubscriptionCreateExternalCustomer
+
+
+class SubscriptionUpdateBase(MetadataInputMixin, Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: UUID4 | None = Field(
+        default=None,
+        description="Update subscription to another product.",
+        examples=[PRODUCT_ID_EXAMPLE],
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+    discount_id: UUID4 | None = Field(
+        default=None,
+        description=(
+            "Update the subscription to apply a new discount. "
+            "If set to `null`, the discount will be removed."
+            " The change will be applied on the next billing cycle."
+        ),
+    )
+    trial_end: FutureDatetime | Literal["now"] | None = Field(
+        default=None,
+        description=(
+            "Set or extend the trial period of the subscription. "
+            "If set to `now`, the trial will end immediately and the first "
+            "billing cycle will be charged synchronously. The subscription "
+            "remains trialing if the payment fails."
+        ),
+    )
+
+    @property
+    def has_product(self) -> bool:
+        return self.product_id is not None
+
+    @property
+    def has_trial_end(self) -> bool:
+        return self.trial_end is not None
+
+    @property
+    def has_metadata(self) -> bool:
+        return "metadata" in self.model_fields_set
+
+    @property
+    def discount(self) -> UUID4 | Literal["unset"] | None:
+        if self.discount_id is not None:
+            return self.discount_id
+        if "discount_id" in self.model_fields_set:
+            return "unset"
+        return None
+
+
+class SubscriptionUpdateSeats(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    seats: Int32 = Field(
+        description="Update the number of seats for this subscription.",
+        ge=1,
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+
+
+class SubscriptionUpdateUnits(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    units: Int32 = Field(
+        description="Update the number of units for this subscription.",
+        ge=1,
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+
+
+class SubscriptionUpdateBillingPeriod(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    current_billing_period_end: FutureDatetime = Field(
+        description=inspect.cleandoc(
+            """
+            Set a new date for the end of the current billing period. The subscription will renew on this date. The new date can be earlier or later than the current period end, as long as it's in the future.
+
+            If the subscription is set to cancel at the end of the period, it'll end on this new date instead.
+
+            It is not possible to update the current billing period on a subscription that's already revoked or not active.
+            """
+        ),
+    )
+
+
+class SubscriptionCancelBase(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    customer_cancellation_reason: CustomerCancellationReason | None = Field(
+        None,
+        description=inspect.cleandoc(
+            """
+        Customer reason for cancellation.
+
+        Helpful to monitor reasons behind churn for future improvements.
+
+        Only set this in case your own service is requesting the reason from the
+        customer. Or you know based on direct conversations, i.e support, with
+        the customer.
+
+        * `too_expensive`: Too expensive for the customer.
+        * `missing_features`: Customer is missing certain features.
+        * `switched_service`: Customer switched to another service.
+        * `unused`: Customer is not using it enough.
+        * `customer_service`: Customer is not satisfied with the customer service.
+        * `low_quality`: Customer is unhappy with the quality.
+        * `too_complex`: Customer considers the service too complicated.
+        * `other`: Other reason(s).
+        """
+        ),
+    )
+    customer_cancellation_comment: str | None = Field(
+        None,
+        description=inspect.cleandoc(
+            """
+            Customer feedback and why they decided to cancel.
+
+            **IMPORTANT:**
+            Do not use this to store internal notes! It's intended to be input
+            from the customer and is therefore also available in their Polar
+            purchases library.
+
+            Only set this in case your own service is requesting the reason from the
+            customer. Or you copy a message directly from a customer
+            conversation, i.e support.
+            """
+        ),
+    )
+
+
+class SubscriptionCancel(SubscriptionCancelBase):
+    cancel_at_period_end: bool = Field(
+        json_schema_extra=destructive_when_equals(True),
+        description=inspect.cleandoc(
+            """
+        Cancel an active subscription once the current period ends.
+
+        Or uncancel a subscription currently set to be revoked at period end.
+        """
+        ),
+    )
+
+
+class SubscriptionRevoke(SubscriptionCancelBase):
+    revoke: Literal[True] = Field(
+        description="Cancel and revoke an active subscription immediately",
+        json_schema_extra=destructive_when_equals(True),
+    )
+
+
+class SubscriptionPause(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    pause_at_period_end: bool = Field(
+        json_schema_extra=destructive_when_equals(True),
+        description=inspect.cleandoc(
+            """
+        Pause an active subscription at the end of the current period.
+
+        Or cancel a scheduled pause on a subscription set to be paused at
+        period end.
+        """
+        ),
+    )
+    resumes_at: FutureDatetime | None = Field(
+        None,
+        description=inspect.cleandoc(
+            """
+        Date at which the paused subscription should automatically resume.
+
+        If not set, the subscription stays paused until it is resumed manually.
+        Must be after the current period end.
+        """
+        ),
+    )
+
+
+class SubscriptionResume(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    resume: Literal[True] = Field(
+        description=(
+            "Resume a paused subscription immediately, "
+            "starting a new billing period and charging the customer."
+        ),
+        json_schema_extra=destructive_when_equals(True),
+    )
+
+
+class SubscriptionUpdateClear(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    pending_update: None = Field(
+        description="Clear the pending subscription update. Set to null to remove scheduled changes."
+    )
+
+
+SubscriptionUpdate = Annotated[
+    SubscriptionUpdateBase
+    | SubscriptionUpdateSeats
+    | SubscriptionUpdateUnits
+    | SubscriptionUpdateBillingPeriod
+    | SubscriptionCancel
+    | SubscriptionRevoke
+    | SubscriptionPause
+    | SubscriptionResume
+    | SubscriptionUpdateClear,
+    SetSchemaReference("SubscriptionUpdate"),
+]
+
+
+class SubscriptionChargePreviewProration(Schema):
+    """A pending proration adjustment to be billed on the next invoice."""
+
+    label: str = Field(description="Human-readable description of the proration.")
+    amount: int = Field(
+        description=("Signed amount in cents: positive to charge, negative to credit.")
+    )
+
+
+class SubscriptionChargePreview(Schema):
+    """Preview of the next charge for a subscription."""
+
+    base_amount: int = Field(
+        description="Base subscription amount in cents (sum of product prices)"
+    )
+    metered_amount: int = Field(
+        description=(
+            "Metered usage in cents billed on this invoice. Zero when usage is "
+            "billed on its own meter cycle, ending before this invoice."
+        )
+    )
+    proration_amount: int = Field(
+        description=(
+            "Net pending proration adjustments in cents from mid-period changes "
+            "(seat or product changes), to be billed on the next invoice."
+        )
+    )
+    prorations: list[SubscriptionChargePreviewProration] = Field(
+        description="Itemized pending proration adjustments to be billed on the next invoice."
+    )
+    subtotal_amount: int = Field(
+        description="Subtotal amount in cents (base + metered + prorations, before discount and tax)"
+    )
+    discount_amount: int = Field(description="Discount amount in cents")
+    net_amount: int = Field(description="Net amount in cents before taxes")
+    tax_amount: int = Field(description="Tax amount in cents")
+    total_amount: int = Field(
+        description="Total amount in cents (net + tax, before applying wallet balance)"
+    )
+    applied_balance_amount: int = Field(
+        description=(
+            "Wallet balance applied to this charge in cents: negative when the "
+            "customer's account credit reduces the amount due, positive when the "
+            "charge clears outstanding debt, zero otherwise."
+        )
+    )
+    due_amount: int = Field(
+        description=(
+            "Amount actually due in cents: total_amount plus the applied wallet "
+            "balance, floored at zero. This is the figure charged today."
+        )
+    )
+
+
+class SubscriptionMeterChargePreview(Schema):
+    """Preview of the metered usage billed at the end of the current meter cycle."""
+
+    metered_amount: int = Field(description="Metered usage amount in cents.")
+    subtotal_amount: int = Field(
+        description="Subtotal amount in cents, before discount and tax."
+    )
+    discount_amount: int = Field(description="Discount amount in cents.")
+    net_amount: int = Field(description="Net amount in cents, before taxes.")
+    tax_amount: int = Field(description="Tax amount in cents.")
+    total_amount: int = Field(
+        description="Total amount in cents, before applying the wallet balance."
+    )
+
+
+class SubscriptionCancelPreview(Schema):
+    """Preview of the effect of cancelling a subscription right now."""
+
+    stops_collection: bool = Field(
+        description=(
+            "Whether cancelling now also stops collecting the outstanding payment. "
+            "True for a past-due subscription whose organization has no benefit "
+            "revocation grace period: cancelling voids the pending order and stops "
+            "dunning retries."
+        )
+    )
+    outstanding_amount: int | None = Field(
+        description=(
+            "Amount in cents still due on the pending order that would be voided, "
+            "or null when nothing would be dropped."
+        )
+    )
+
+
+class SubscriptionChangePreviewProduct(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: UUID4 = Field(
+        description="Preview a change of the subscription to this product.",
+        examples=[PRODUCT_ID_EXAMPLE],
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+
+
+class SubscriptionChangePreviewSeats(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    seats: Int32 = Field(
+        description="Preview a change of the subscription to this number of seats.",
+        ge=1,
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+
+
+class SubscriptionChangePreviewUnits(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    units: Int32 = Field(
+        description="Preview a change of the subscription to this number of units.",
+        ge=1,
+    )
+    proration_behavior: SubscriptionProrationBehavior | None = Field(
+        default=None,
+        description=(
+            "Determine how to handle the proration billing. "
+            "If not provided, will use the default organization setting."
+        ),
+    )
+
+
+SubscriptionChangePreview = Annotated[
+    SubscriptionChangePreviewProduct
+    | SubscriptionChangePreviewSeats
+    | SubscriptionChangePreviewUnits,
+    SetSchemaReference("SubscriptionChangePreview"),
+]
+
+
+SubscriptionBulkUpdateID = Annotated[
+    UUID4, Path(description="The subscription bulk update ID.")
+]
+
+
+class SubscriptionBulkUpdateCreate(Schema):
+    model_config = ConfigDict(extra="forbid")
+
+    product_external_id: str = Field(
+        min_length=1,
+        description=(
+            "`external_id` of the product whose subscriptions move, in any version."
+        ),
+    )
+    target_product_id: UUID4 = Field(
+        description="ID of the product to move to. Must be a current version.",
+        examples=[PRODUCT_ID_EXAMPLE],
+    )
+    proration_behavior: Literal[SubscriptionProrationBehavior.next_period] = Field(
+        default=SubscriptionProrationBehavior.next_period,
+        description="When each subscription moves. Each one moves at its own renewal.",
+    )
+
+
+class SubscriptionBulkUpdate(IDSchema, TimestampedSchema):
+    organization_id: UUID4 = Field(description="The organization ID.")
+    product_external_id: str = Field(
+        validation_alias="source_external_id",
+        description="`external_id` of the product whose subscriptions move.",
+    )
+    target_product_id: UUID4 = Field(description="ID of the product to move to.")
+    proration_behavior: SubscriptionProrationBehavior = Field(
+        description="When each subscription moves."
+    )
+    subscriptions_count: int = Field(
+        description="Subscriptions scheduled to move at their renewal so far."
+    )
+    skipped_count: int = Field(
+        description="Subscriptions that couldn't move, for example on a currency mismatch."
+    )
+    completed_at: datetime | None = Field(
+        description="When every subscription was handled. `None` while running."
+    )
+
+
+class SubscriptionListParams(QuerySchema):
+    organization_id: MultipleQueryFilter[OrganizationID] | None = Field(
+        None, title="OrganizationID Filter", description="Filter by organization ID."
+    )
+    product_id: MultipleQueryFilter[ProductID] | None = Field(
+        None, title="ProductID Filter", description="Filter by product ID."
+    )
+    external_product_id: Annotated[
+        MultipleQueryFilter[str] | None, Version(starting_from=V2027_01)
+    ] = Field(
+        None,
+        title="ExternalProductID Filter",
+        description="Filter by product external ID.",
+    )
+    customer_id: MultipleQueryFilter[CustomerID] | None = Field(
+        None, title="CustomerID Filter", description="Filter by customer ID."
+    )
+    external_customer_id: MultipleQueryFilter[ExternalCustomerID] | None = Field(
+        None,
+        title="ExternalCustomerID Filter",
+        description="Filter by customer external ID.",
+    )
+    discount_id: MultipleQueryFilter[DiscountID] | None = Field(
+        None, title="DiscountID Filter", description="Filter by discount ID."
+    )
+    active: bool | None = Field(
+        None, description="Filter by active or inactive subscription.", deprecated=True
+    )
+    status: MultipleQueryFilter[SubscriptionStatus] | None = Field(
+        None, title="Status Filter", description="Filter by subscription status."
+    )
+    cancel_at_period_end: bool | None = Field(
+        None,
+        description="Filter by subscriptions that are set to cancel at period end.",
+    )
+    customer_cancellation_reason: (
+        MultipleQueryFilter[CustomerCancellationReason] | None
+    ) = Field(
+        None,
+        title="CustomerCancellationReason Filter",
+        description="Filter by customer cancellation reason.",
+    )
+    canceled_at_after: datetime | None = Field(
+        None, description="Filter by cancellation date (after or equal to)."
+    )
+    canceled_at_before: datetime | None = Field(
+        None, description="Filter by cancellation date (before or equal to)."
+    )
+    started_after: datetime | None = Field(
+        None, description="Only include subscriptions started after this date."
+    )
+    started_before: datetime | None = Field(
+        None, description="Only include subscriptions started before this date."
+    )

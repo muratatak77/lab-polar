@@ -1,0 +1,252 @@
+#!/bin/bash
+# Prepares a Claude Code on the web container to run the test suites and linters.
+# Mirrors .github/workflows/test_server.yaml rather than `dev up`, which is built for
+# interactive local development. No `set -e`: steps are advisory and the summary reports
+# failures, so one broken step never blocks the session.
+set -uo pipefail
+
+if [ "${CLAUDE_CODE_REMOTE:-}" != "true" ]; then
+  exit 0
+fi
+
+ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+TMP="${TMPDIR:-/tmp}"
+LOG="$TMP/polar-session-start.log"
+CONTAINERD_PIDFILE=/run/docker/containerd/containerd.pid
+DOCKERD_PIDFILE=/var/run/docker.pid
+DOCKERD_LOG="$TMP/polar-dockerd.log"
+COMPOSE=(docker compose --project-directory "$ROOT/server")
+# uv needs ~/.local/bin first; /usr/local/bin is appended because its node symlink is
+# older than the one already on PATH and the workspace does not support it.
+export PATH="$HOME/.local/bin:$PATH:/usr/local/bin"
+: > "$LOG"
+
+FAILURES=()
+NOTES=()
+
+step() {
+  local name="$1" start rc=0
+  shift
+  start=$(date +%s)
+  printf '\n=== %s ===\n' "$name" >> "$LOG"
+  "$@" >> "$LOG" 2>&1 || rc=1
+  [ $rc -eq 0 ] || FAILURES+=("$name")
+  printf '%s: %s (%ss)\n' "$name" \
+    "$([ $rc -eq 0 ] && echo ok || echo FAILED)" \
+    "$(( $(date +%s) - start ))" >> "$LOG"
+  return $rc
+}
+
+# An "optional" step is a pure optimisation, kept out of FAILURES so the summary only
+# reports what actually breaks a test run.
+reap() {
+  local name="$1" pid="$2" logfile="$3" optional="${4:-}" rc=0
+  wait "$pid" || rc=1
+  printf '\n=== %s (background) ===\n' "$name" >> "$LOG"
+  cat "$logfile" >> "$LOG" 2>/dev/null
+  if [ $rc -eq 0 ]; then
+    printf '%s: ok\n' "$name" >> "$LOG"
+  elif [ -n "$optional" ]; then
+    printf '%s: skipped, continuing\n' "$name" >> "$LOG"
+  else
+    FAILURES+=("$name")
+    printf '%s: FAILED\n' "$name" >> "$LOG"
+  fi
+}
+
+PRIVILEGED=()
+if [ "$(id -u)" -ne 0 ] && sudo -n true >/dev/null 2>&1; then
+  PRIVILEGED=(sudo -n)
+fi
+
+# A resumed container keeps /run, and dockerd hangs trusting an orphaned pidfile.
+# Test the pid rather than the process name: an unrelated containerd also matches.
+clear_stale_docker_state() {
+  local pidfile
+  for pidfile in "$CONTAINERD_PIDFILE" "$DOCKERD_PIDFILE"; do
+    if [ -f "$pidfile" ] &&
+      ! "${PRIVILEGED[@]}" kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+      "${PRIVILEGED[@]}" rm -f "$pidfile" /var/run/docker.sock
+    fi
+  done
+}
+
+start_dockerd() {
+  clear_stale_docker_state
+  setsid nohup "${PRIVILEGED[@]}" dockerd >>"$DOCKERD_LOG" 2>&1 &
+}
+
+# There is no systemd here, so `dev up`'s `systemctl start docker` cannot work.
+# Readiness is checked later, so a daemon slow to boot is not written off.
+launch_dockerd() {
+  docker info >/dev/null 2>&1 && return 0
+  command -v dockerd >/dev/null 2>&1 || return 1
+
+  if [ "$(id -u)" -ne 0 ] && [ ${#PRIVILEGED[@]} -eq 0 ]; then
+    echo "dockerd requires root and passwordless sudo is unavailable"
+    return 1
+  fi
+
+  : >"$DOCKERD_LOG"
+  start_dockerd
+}
+
+wait_dockerd() {
+  for _ in $(seq 1 60); do
+    docker info >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# A daemon that never came up is restarted once: a manual restart has recovered it in
+# seconds where the first boot hung past the timeout.
+ensure_dockerd() {
+  wait_dockerd && return 0
+
+  if pgrep -x dockerd >/dev/null; then
+    echo "dockerd running but not answering after 60s; restarting it once"
+    "${PRIVILEGED[@]}" pkill -x dockerd
+  else
+    echo "dockerd exited before becoming ready; last lines of $DOCKERD_LOG:"
+    tail -n 20 "$DOCKERD_LOG"
+    echo "restarting it once"
+  fi
+  sleep 2
+  printf '\n--- restart ---\n' >>"$DOCKERD_LOG"
+  start_dockerd
+  wait_dockerd && return 0
+
+  echo "dockerd still not ready; last lines of $DOCKERD_LOG:"
+  tail -n 20 "$DOCKERD_LOG"
+  return 1
+}
+
+DOCKER_LAUNCHED=0
+step "docker daemon" launch_dockerd && DOCKER_LAUNCHED=1
+
+# Must precede compose, which interpolates the Postgres credentials and MinIO bucket
+# names from server/.env and silently starts dead containers without them.
+if [ ! -f "$ROOT/server/.env" ] ||
+  [ ! -f "$ROOT/clients/apps/web/.env.local" ]; then
+  step "env files" "$ROOT/dev/setup-environment"
+fi
+
+# The image pull and the frontend install share nothing with the Python setup, so they
+# run underneath it. The pull waits for the daemon inside the job to keep that overlap.
+PULL_LOG="$TMP/polar-compose-pull.log"
+PULL_PID=
+pull_images() {
+  wait_dockerd || return 1
+  "${COMPOSE[@]}" pull --quiet db redis minio minio-setup
+}
+if [ "$DOCKER_LAUNCHED" -eq 1 ]; then
+  pull_images >"$PULL_LOG" 2>&1 &
+  PULL_PID=$!
+fi
+
+# pnpm 12 is a native binary that its postinstall swaps in for a shebang-less shim. The
+# image's older pnpm switches to the packageManager version without running that
+# postinstall, so on a turbo cache miss every task fails with "Exec format error".
+ensure_pnpm() {
+  local version prefix current
+  version=$(sed -n 's/.*"packageManager": *"pnpm@\([0-9.]*\).*/\1/p' \
+    "$ROOT/clients/package.json")
+  if [ -z "$version" ]; then
+    echo "no pnpm version in clients/package.json packageManager; using pnpm on PATH"
+    return 0
+  fi
+  prefix="$HOME/.local/share/polar-pnpm/$version"
+
+  current=$(readlink -f "$(command -v pnpm)" 2>/dev/null)
+  if [ -n "$current" ] && [ "$(head -c 4 "$current")" = $'\x7fELF' ] &&
+    [ "$("$current" --version 2>/dev/null)" = "$version" ]; then
+    return 0
+  fi
+
+  echo "installing native pnpm $version"
+  [ -x "$prefix/bin/pnpm" ] ||
+    npm install -g --prefix "$prefix" "pnpm@$version" || return 1
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$prefix/bin/pnpm" "$HOME/.local/bin/pnpm"
+  ln -sf "$prefix/bin/pnpx" "$HOME/.local/bin/pnpx"
+}
+
+PNPM_LOG="$TMP/polar-pnpm-install.log"
+{ ensure_pnpm && pnpm --dir "$ROOT/clients" install --frozen-lockfile; } >"$PNPM_LOG" 2>&1 &
+PNPM_PID=$!
+
+# --dev carries pytest, mypy, ruff, fakeredis and xdist.
+step "uv sync" uv sync --dev --frozen --directory "$ROOT/server"
+
+# The other import-blocking artifact. polar.config only checks that the path exists, so
+# fall back to the stub test_sdk.yaml already relies on rather than leaving it unimportable.
+if [ ! -f "$ROOT/server/emails/bin/react-email-pkg" ]; then
+  if ! step "email renderer" uv run --directory "$ROOT/server" task emails; then
+    mkdir -p "$ROOT/server/emails/bin"
+    touch "$ROOT/server/emails/bin/react-email-pkg"
+    NOTES+=("Email renderer build failed; stubbed the binary so polar.config imports. Tests that actually render an email will fail -- run 'uv run task emails' in server/ to fix.")
+  fi
+fi
+
+# Pre-warming only, so a Docker Hub 429 must not read as a broken environment.
+[ -n "$PULL_PID" ] && reap "image pull" "$PULL_PID" "$PULL_LOG" optional
+
+PG_OK=0
+if [ "$DOCKER_LAUNCHED" -eq 1 ] && step "docker daemon ready" ensure_dockerd; then
+  # --wait uses the healthchecks docker-compose.yml declares. Services are named because
+  # a bare `up -d` also pulls tinybird, whose tests skip themselves when it is absent.
+  if step "infrastructure" "${COMPOSE[@]}" up -d --wait --wait-timeout 120 db redis minio; then
+    PG_OK=1
+    # `run`, not `up -d`: this container exits when the bucket script finishes, so only
+    # `run` propagates that script's exit code.
+    step "minio buckets" "${COMPOSE[@]}" run --rm -T minio-setup
+  else
+    "${COMPOSE[@]}" ps -a >> "$LOG" 2>&1
+    "${COMPOSE[@]}" logs --tail 20 >> "$LOG" 2>&1
+  fi
+else
+  NOTES+=("Docker daemon unavailable, so PostgreSQL and MinIO are not running. Skipped the template database and the pytest warm-up; backend tests will fail until the daemon is up. See $LOG and $DOCKERD_LOG.")
+fi
+
+# Lets each xdist worker clone a migrated database instead of replaying the whole alembic
+# history. `task db_recreate` does this from config but replays every migration each run.
+build_template_db() {
+  "$ROOT/dev/create-test-db" || return 1
+  POLAR_ENV=testing uv run --directory "$ROOT/server" task db_migrate
+}
+if [ "$PG_OK" -eq 1 ] && step "test template db" build_template_db; then
+  # Exported in-process too, so the warm-up below clones rather than re-migrating.
+  export POLAR_TEST_DATABASE_TEMPLATE="polar_test"
+  # At most once: the env file outlives a single run and would grow unboundedly.
+  if [ -n "${CLAUDE_ENV_FILE:-}" ] &&
+    ! grep -q POLAR_TEST_DATABASE_TEMPLATE "$CLAUDE_ENV_FILE" 2>/dev/null; then
+    echo 'export POLAR_TEST_DATABASE_TEMPLATE="polar_test"' >> "$CLAUDE_ENV_FILE"
+  fi
+  NOTES+=("POLAR_TEST_DATABASE_TEMPLATE=polar_test is set, so pytest clones a pre-migrated database per xdist worker. If you ADD a migration this session, re-run 'POLAR_ENV=testing uv run task db_migrate' in server/ to refresh the template, or the cloned schema will be stale.")
+fi
+
+# mypy is the only CPU-bound step, so it overlaps the frontend install, not the pull.
+MYPY_LOG="$TMP/polar-mypy-warm.log"
+uv run --directory "$ROOT/server" task lint_types >"$MYPY_LOG" 2>&1 &
+MYPY_PID=$!
+
+# Warms bytecode and absorbs a first-run database flake. Needs Postgres even though these
+# tests never query it, because an autouse session fixture creates a database regardless.
+if [ "$PG_OK" -eq 1 ]; then
+  step "warm pytest" env POLAR_ENV=testing uv run --directory "$ROOT/server" \
+    python -m pytest tests/kit/test_address.py -q --no-cov -p no:randomly
+fi
+
+# Optional: a non-zero exit means a type error in the code, not a broken environment.
+reap "warm mypy cache" "$MYPY_PID" "$MYPY_LOG" optional
+reap "pnpm install" "$PNPM_PID" "$PNPM_LOG"
+
+echo "Polar environment prepared for tests and linters. Log: $LOG"
+if [ ${#FAILURES[@]} -gt 0 ]; then
+  echo "Setup steps that FAILED: ${FAILURES[*]}"
+  echo "Check $LOG before trusting a test run."
+fi
+for note in ${NOTES+"${NOTES[@]}"}; do echo "Note: $note"; done
+echo "If a PDF or invoice test fails on missing CJK glyphs:" \
+  "apt-get install -y --no-install-recommends fonts-noto-cjk"

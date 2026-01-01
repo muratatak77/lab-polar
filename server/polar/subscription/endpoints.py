@@ -1,0 +1,536 @@
+from typing import Annotated
+from zoneinfo import ZoneInfo
+
+import structlog
+from fastapi import Depends, Query
+
+from polar.auth.permission import OrganizationPermission
+from polar.authz.service import assert_resource_permission
+from polar.exceptions import NotPermitted, PaymentNotReady, ResourceNotFound
+from polar.kit.csv import CSVStreamingResponse
+from polar.kit.metadata import MetadataQuery, get_metadata_query_openapi_schema
+from polar.kit.pagination import ListResource, PaginationParamsQuery
+from polar.kit.versioning import version
+from polar.models import Subscription, SubscriptionBulkUpdate
+from polar.openapi import APITag, cli_preview
+from polar.order.service import PaymentActionRequired, PaymentFailed
+from polar.postgres import (
+    AsyncReadSession,
+    AsyncSession,
+    get_db_read_session,
+    get_db_session,
+)
+from polar.routing import APIRouter
+from polar.subscription.schemas import SubscriptionListParams
+from polar.version import V2027_01
+
+from . import auth, sorting
+from .bulk_update import subscription_bulk_update as subscription_bulk_update_service
+from .export import (
+    SubscriptionExportParams,
+    generate_csv,
+    get_filename,
+)
+from .schemas import Subscription as SubscriptionSchema
+from .schemas import SubscriptionBulkUpdate as SubscriptionBulkUpdateSchema
+from .schemas import (
+    SubscriptionBulkUpdateCreate,
+    SubscriptionBulkUpdateID,
+    SubscriptionCancelPreview,
+    SubscriptionChangePreview,
+    SubscriptionChangePreviewSeats,
+    SubscriptionChangePreviewUnits,
+    SubscriptionChargePreview,
+    SubscriptionCreate,
+    SubscriptionID,
+    SubscriptionMeterChargePreview,
+    SubscriptionUpdate,
+)
+from .service import (
+    AlreadyCanceledSubscription,
+    InactiveSubscription,
+    SubscriptionLocked,
+    SubscriptionNotScheduledToCancel,
+    SubscriptionUpdateContext,
+)
+from .service import subscription as subscription_service
+
+log = structlog.get_logger()
+
+router = APIRouter(prefix="/subscriptions", tags=["subscriptions", APITag.public])
+
+SubscriptionNotFound = {
+    "description": "Subscription not found.",
+    "model": ResourceNotFound.schema(),
+}
+
+SubscriptionBulkUpdateNotFound = {
+    "description": "Subscription bulk update not found.",
+    "model": ResourceNotFound.schema(),
+}
+
+
+@router.get(
+    "/",
+    response_model=ListResource[SubscriptionSchema],
+    summary="List Subscriptions",
+    tags=[APITag.mcp, APITag.cli],
+    openapi_extra={"parameters": [get_metadata_query_openapi_schema()]},
+)
+async def list(
+    auth_subject: auth.SubscriptionsRead,
+    pagination: PaginationParamsQuery,
+    sorting: sorting.ListSorting,
+    metadata: MetadataQuery,
+    filters: Annotated[SubscriptionListParams, Query()],
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> ListResource[SubscriptionSchema]:
+    """List subscriptions."""
+    results, count = await subscription_service.list(
+        session,
+        auth_subject,
+        organization_id=filters.organization_id,
+        product_id=filters.product_id,
+        external_product_id=filters.external_product_id,
+        customer_id=filters.customer_id,
+        external_customer_id=filters.external_customer_id,
+        discount_id=filters.discount_id,
+        active=filters.active,
+        status=filters.status,
+        cancel_at_period_end=filters.cancel_at_period_end,
+        customer_cancellation_reason=filters.customer_cancellation_reason,
+        canceled_at_after=filters.canceled_at_after,
+        canceled_at_before=filters.canceled_at_before,
+        started_after=filters.started_after,
+        started_before=filters.started_before,
+        metadata=metadata,
+        pagination=pagination,
+        sorting=sorting,
+    )
+    return ListResource.from_paginated_results(
+        [SubscriptionSchema.model_validate(result) for result in results],
+        count,
+        pagination,
+    )
+
+
+@router.get(
+    "/export", summary="Export Subscriptions", response_class=CSVStreamingResponse
+)
+async def export(
+    auth_subject: auth.SubscriptionsRead,
+    filters: Annotated[SubscriptionExportParams, Query()],
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> CSVStreamingResponse:
+    """Export subscriptions as a CSV file."""
+    tzinfo = ZoneInfo(filters.timezone)
+    return CSVStreamingResponse(
+        generate_csv(
+            session,
+            auth_subject,
+            organization_id=filters.organization_id,
+            product_id=filters.product_id,
+            external_product_id=filters.external_product_id,
+            status=filters.status,
+            cancel_at_period_end=filters.cancel_at_period_end,
+            started_after=filters.started_after,
+            started_before=filters.started_before,
+            timezone=tzinfo,
+            columns=filters.columns,
+        ),
+        get_filename(filters.started_after, filters.started_before, tzinfo),
+    )
+
+
+@router.get(
+    "/{id}",
+    summary="Get Subscription",
+    openapi_extra=cli_preview(
+        ("id", "ID"),
+        ("status", "Status"),
+        ("customer_id", "Customer ID"),
+        ("product_id", "Product ID"),
+    ),
+    response_model=SubscriptionSchema,
+    tags=[APITag.mcp, APITag.cli],
+    responses={404: SubscriptionNotFound},
+)
+async def get(
+    id: SubscriptionID,
+    auth_subject: auth.SubscriptionsRead,
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> Subscription:
+    """Get a subscription by ID."""
+    subscription = await subscription_service.get(session, auth_subject, id)
+
+    if subscription is None:
+        raise ResourceNotFound()
+
+    return subscription
+
+
+@router.get(
+    "/{id}/charge-preview",
+    summary="Preview Next Charge For Subscription",
+    response_model=SubscriptionChargePreview,
+    responses={404: SubscriptionNotFound},
+    tags=[APITag.private],
+)
+async def get_charge_preview(
+    id: SubscriptionID,
+    auth_subject: auth.SubscriptionsRead,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionChargePreview:
+    """
+    Get a preview of the next charge for an active or trialing subscription.
+
+    Returns a breakdown of:
+    - Base subscription amount
+    - Metered usage charges
+    - Applied discounts
+    - Calculated taxes
+    - Total amount
+
+    For trialing subscriptions, shows what the first charge will be when the trial ends.
+    For subscriptions set to cancel at period end, shows the final charge.
+    For paused subscriptions scheduled to auto-resume, shows the charge on resume.
+    Available for active, trialing, and paused-with-resume subscriptions.
+    """
+    subscription = await subscription_service.get(session, auth_subject, id)
+
+    if subscription is None:
+        raise ResourceNotFound()
+
+    # Allow active/trialing subscriptions, and paused subscriptions scheduled to
+    # auto-resume — they still have an upcoming charge when they resume.
+    is_resumable_pause = (
+        subscription.status == "paused" and subscription.resumes_at is not None
+    )
+    if subscription.status not in ("active", "trialing") and not is_resumable_pause:
+        raise ResourceNotFound()
+
+    # If subscription will end (cancel_at_period_end or ends_at), ensure there's still a charge coming
+    if (
+        subscription.cancel_at_period_end or subscription.ends_at
+    ) and subscription.ended_at:
+        raise ResourceNotFound()
+
+    return await subscription_service.calculate_charge_preview(session, subscription)
+
+
+@router.get(
+    "/{id}/meter-charge-preview",
+    summary="Preview Usage Charge For Subscription",
+    response_model=SubscriptionMeterChargePreview,
+    responses={404: SubscriptionNotFound},
+    tags=[APITag.private],
+)
+async def get_meter_charge_preview(
+    id: SubscriptionID,
+    auth_subject: auth.SubscriptionsRead,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionMeterChargePreview:
+    """
+    Get a preview of the usage charge settled at the end of the current meter cycle.
+
+    Only available when the meter cycle ends before the next subscription invoice;
+    otherwise usage is part of the charge preview.
+    """
+    subscription = await subscription_service.get(session, auth_subject, id)
+
+    if subscription is None or not subscription_service.bills_usage_on_meter_cycle(
+        subscription
+    ):
+        raise ResourceNotFound()
+
+    return await subscription_service.calculate_meter_charge_preview(
+        session, subscription
+    )
+
+
+@router.get(
+    "/{id}/cancel-preview",
+    summary="Preview Subscription Cancellation",
+    response_model=SubscriptionCancelPreview,
+    responses={404: SubscriptionNotFound},
+    tags=[APITag.private],
+)
+async def get_cancel_preview(
+    id: SubscriptionID,
+    auth_subject: auth.SubscriptionsRead,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionCancelPreview:
+    """Preview the effect of cancelling a subscription right now.
+
+    Reports whether cancelling also stops collecting the outstanding payment,
+    and the amount that would no longer be collected.
+    """
+    subscription = await subscription_service.get(session, auth_subject, id)
+
+    if subscription is None:
+        raise ResourceNotFound()
+
+    return await subscription_service.calculate_cancel_preview(session, subscription)
+
+
+@router.post(
+    "/{id}/change-preview",
+    summary="Preview Subscription Change",
+    response_model=SubscriptionChargePreview,
+    responses={
+        403: {"model": AlreadyCanceledSubscription.schema()},
+        404: SubscriptionNotFound,
+    },
+    tags=[APITag.private],
+)
+async def preview_change(
+    id: SubscriptionID,
+    change: SubscriptionChangePreview,
+    auth_subject: auth.SubscriptionsWrite,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionChargePreview:
+    """
+    Preview what a subscription change would cost, without applying it.
+
+    Returns the proration breakdown and the amount due today.
+    """
+    subscription = await subscription_service.get(session, auth_subject, id)
+
+    if subscription is None:
+        raise ResourceNotFound()
+
+    await assert_resource_permission(
+        session,
+        auth_subject,
+        subscription.product,
+        OrganizationPermission.sales_manage,
+    )
+
+    if isinstance(change, SubscriptionChangePreviewSeats):
+        return await subscription_service.calculate_change_preview(
+            session,
+            subscription,
+            seats=change.seats,
+            proration_behavior=change.proration_behavior,
+        )
+
+    if isinstance(change, SubscriptionChangePreviewUnits):
+        return await subscription_service.calculate_change_preview(
+            session,
+            subscription,
+            units=change.units,
+            proration_behavior=change.proration_behavior,
+        )
+
+    return await subscription_service.calculate_change_preview(
+        session,
+        subscription,
+        product_id=change.product_id,
+        proration_behavior=change.proration_behavior,
+    )
+
+
+@router.post(
+    "/",
+    response_model=SubscriptionSchema,
+    status_code=201,
+    summary="Create Subscription",
+    responses={201: {"description": "Subscription created."}},
+)
+async def create(
+    subscription_create: SubscriptionCreate,
+    auth_subject: auth.SubscriptionsWrite,
+    session: AsyncSession = Depends(get_db_session),
+) -> Subscription:
+    """
+    Create a subscription programmatically.
+
+    This endpoint only allows to create subscription on free products.
+    For paid products, use the checkout flow.
+
+    No initial order will be created and no confirmation email will be sent.
+    """
+    return await subscription_service.create(session, subscription_create, auth_subject)
+
+
+@router.post(
+    "/bulk-update",
+    response_model=SubscriptionBulkUpdateSchema,
+    status_code=202,
+    summary="Bulk Update Subscriptions",
+    tags=[APITag.private],
+    responses={
+        202: {"description": "Bulk update started."},
+        403: {
+            "description": (
+                "You don't have the permission to update subscriptions, "
+                "or the organization doesn't use catalog versioning."
+            ),
+            "model": NotPermitted.schema(),
+        },
+    },
+)
+@version(starting_from=V2027_01)
+async def bulk_update(
+    bulk_update_create: SubscriptionBulkUpdateCreate,
+    auth_subject: auth.SubscriptionsWrite,
+    session: AsyncSession = Depends(get_db_session),
+) -> SubscriptionBulkUpdate:
+    """
+    Move the active subscriptions of a product, in any version, to another product.
+
+    Subscriptions move in the background, each one at its own renewal. Subscriptions
+    that are canceling or already have a pending change are left alone.
+    """
+    return await subscription_bulk_update_service.create(
+        session, auth_subject, bulk_update_create
+    )
+
+
+@router.get(
+    "/bulk-update/{id}",
+    response_model=SubscriptionBulkUpdateSchema,
+    summary="Get Subscription Bulk Update",
+    tags=[APITag.private],
+    responses={404: SubscriptionBulkUpdateNotFound},
+)
+@version(starting_from=V2027_01)
+async def get_bulk_update(
+    id: SubscriptionBulkUpdateID,
+    auth_subject: auth.SubscriptionsRead,
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> SubscriptionBulkUpdate:
+    """Get the progress of a subscription bulk update."""
+    bulk_update = await subscription_bulk_update_service.get(session, auth_subject, id)
+
+    if bulk_update is None:
+        raise ResourceNotFound()
+
+    return bulk_update
+
+
+@router.patch(
+    "/{id}",
+    summary="Update Subscription",
+    response_model=SubscriptionSchema,
+    tags=[APITag.mcp, APITag.cli],
+    responses={
+        200: {"description": "Subscription updated."},
+        402: {
+            "description": (
+                "The charge failed, or requires customer authentication "
+                "that can't be completed off-session."
+            ),
+            "model": PaymentFailed.schema() | PaymentActionRequired.schema(),
+        },
+        403: {
+            "description": (
+                "Subscription is already canceled or will be at the end of the "
+                "period, is not active, or the organization is not ready to renew "
+                "subscriptions."
+            ),
+            "model": AlreadyCanceledSubscription.schema()
+            | InactiveSubscription.schema()
+            | PaymentNotReady.schema(),
+        },
+        404: SubscriptionNotFound,
+        409: {
+            "description": (
+                "Subscription is pending an update, or is not scheduled to be canceled."
+            ),
+            "model": SubscriptionLocked.schema()
+            | SubscriptionNotScheduledToCancel.schema(),
+        },
+    },
+)
+async def update(
+    id: SubscriptionID,
+    subscription_update: SubscriptionUpdate,
+    auth_subject: auth.SubscriptionsWrite,
+    session: AsyncSession = Depends(get_db_session),
+) -> Subscription:
+    """Update a subscription."""
+    subscription = await subscription_service.get(
+        session, auth_subject, id, for_update=True
+    )
+    if subscription is None:
+        raise ResourceNotFound()
+
+    await assert_resource_permission(
+        session,
+        auth_subject,
+        subscription.product,
+        OrganizationPermission.sales_manage,
+    )
+
+    log.info(
+        "subscription.update",
+        id=id,
+        customer_id=auth_subject.subject.id,
+        updated_fields=sorted(subscription_update.model_fields_set),
+        updates=subscription_update.model_dump(
+            include={
+                "product_id",
+                "discount_id",
+                "proration_behavior",
+                "cancel_at_period_end",
+                "customer_cancellation_reason",
+                "revoke",
+                "pause_at_period_end",
+                "resume",
+            },
+            exclude_unset=True,
+        ),
+    )
+    async with SubscriptionUpdateContext(
+        session, subscription, subscription_service
+    ) as ctx:
+        return await subscription_service.update(
+            session, ctx, subscription, update=subscription_update
+        )
+
+
+@router.delete(
+    "/{id}",
+    summary="Revoke Subscription",
+    response_model=SubscriptionSchema,
+    tags=[APITag.mcp, APITag.cli],
+    responses={
+        200: {"description": "Subscription revoked."},
+        403: {
+            "description": "This subscription is already revoked.",
+            "model": AlreadyCanceledSubscription.schema(),
+        },
+        404: SubscriptionNotFound,
+        409: {
+            "description": "Subscription is pending an update.",
+            "model": SubscriptionLocked.schema(),
+        },
+    },
+)
+async def revoke(
+    id: SubscriptionID,
+    auth_subject: auth.SubscriptionsWrite,
+    session: AsyncSession = Depends(get_db_session),
+) -> Subscription:
+    """Revoke a subscription, i.e cancel immediately."""
+    subscription = await subscription_service.get(
+        session, auth_subject, id, for_update=True
+    )
+    if subscription is None:
+        raise ResourceNotFound()
+
+    await assert_resource_permission(
+        session,
+        auth_subject,
+        subscription.product,
+        OrganizationPermission.sales_manage,
+    )
+
+    log.info(
+        "subscription.revoke", id=id, admin_id=auth_subject.subject.id, immediate=True
+    )
+    async with SubscriptionUpdateContext(
+        session, subscription, subscription_service
+    ) as ctx:
+        return await subscription_service.revoke(session, ctx, subscription)
