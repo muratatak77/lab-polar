@@ -2517,6 +2517,28 @@ export interface paths {
     patch: operations['webhooks:reset_webhook_endpoint_secret']
     trace?: never
   }
+  '/v1/webhooks/endpoints/{id}/status-changes': {
+    parameters: {
+      query?: never
+      header?: never
+      path?: never
+      cookie?: never
+    }
+    /**
+     * List Webhook Endpoint Status Changes
+     * @description List the times a webhook endpoint was enabled or disabled, most recent first.
+     *
+     *     **Scopes**: `webhooks:read` `webhooks:write`
+     */
+    get: operations['webhooks:list_webhook_endpoint_status_changes']
+    put?: never
+    post?: never
+    delete?: never
+    options?: never
+    head?: never
+    patch?: never
+    trace?: never
+  }
   '/v1/webhooks/deliveries': {
     parameters: {
       query?: never
@@ -26314,6 +26336,12 @@ export interface components {
       items: components['schemas']['WebhookDelivery'][]
       pagination: components['schemas']['Pagination']
     }
+    /** ListResource[WebhookEndpointStatusChange] */
+    ListResource_WebhookEndpointStatusChange_: {
+      /** Items */
+      items: components['schemas']['WebhookEndpointStatusChange'][]
+      pagination: components['schemas']['Pagination']
+    }
     /** ListResource[WebhookEndpoint] */
     ListResource_WebhookEndpoint_: {
       /** Items */
@@ -41874,6 +41902,11 @@ export interface components {
        */
       enabled: boolean
       /**
+       * Disabled At
+       * @description When the webhook endpoint was last disabled. `null` if the endpoint is enabled.
+       */
+      disabled_at: string | null
+      /**
        * Uses Standard Webhook Signature
        * @description Whether Polar signs deliveries to this endpoint with Standard Webhooks. False means Polar's original HMAC over the UTF-8 bytes of the full secret.
        */
@@ -41916,6 +41949,51 @@ export interface components {
        */
       organization_id?: string | null
     }
+    /**
+     * WebhookEndpointStatusChange
+     * @description A change of a webhook endpoint's enabled state.
+     */
+    WebhookEndpointStatusChange: {
+      /**
+       * Created At
+       * Format: date-time
+       * @description Creation timestamp of the object.
+       * @example 2026-01-01T00:00:00.000000Z
+       */
+      created_at: string
+      /**
+       * Modified At
+       * @description Last modification timestamp of the object.
+       */
+      modified_at: string | null
+      /**
+       * Id
+       * Format: uuid4
+       * @description The ID of the object.
+       */
+      id: string
+      /**
+       * Webhook Endpoint Id
+       * Format: uuid4
+       * @description The ID of the webhook endpoint that changed.
+       */
+      webhook_endpoint_id: string
+      /**
+       * Enabled
+       * @description Whether the webhook endpoint was enabled or disabled.
+       */
+      enabled: boolean
+      /** @description Why the state changed. `manual` when changed through the API or the dashboard, `consecutive_failures` when Polar disabled the endpoint after too many failed deliveries, `admin` when changed by Polar's support. */
+      reason: components['schemas']['WebhookEndpointStatusChangeReason']
+    }
+    /**
+     * WebhookEndpointStatusChangeReason
+     * @enum {string}
+     */
+    WebhookEndpointStatusChangeReason:
+      | 'manual'
+      | 'consecutive_failures'
+      | 'admin'
     /**
      * WebhookEndpointUpdate
      * @description Schema to update a webhook endpoint.
@@ -49093,6 +49171,52 @@ export interface operations {
         }
         content: {
           'application/json': components['schemas']['WebhookEndpoint']
+        }
+      }
+      /** @description Webhook endpoint not found. */
+      404: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ResourceNotFound']
+        }
+      }
+      /** @description Validation Error */
+      422: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['HTTPValidationError']
+        }
+      }
+    }
+  }
+  'webhooks:list_webhook_endpoint_status_changes': {
+    parameters: {
+      query?: {
+        /** @description Page number, defaults to 1. */
+        page?: number
+        /** @description Size of a page, defaults to 10. Maximum is 100. */
+        limit?: number
+      }
+      header?: never
+      path: {
+        /** @description The webhook endpoint ID. */
+        id: string
+      }
+      cookie?: never
+    }
+    requestBody?: never
+    responses: {
+      /** @description Successful Response */
+      200: {
+        headers: {
+          [name: string]: unknown
+        }
+        content: {
+          'application/json': components['schemas']['ListResource_WebhookEndpointStatusChange_']
         }
       }
       /** @description Webhook endpoint not found. */
@@ -75683,6 +75807,9 @@ export const walletTypeValues: ReadonlyArray<
 export const webhookEndpointCreateApi_versionValues: ReadonlyArray<
   FlattenedDeepRequired<components>['schemas']['WebhookEndpointCreate']['api_version']
 > = ['2026-04', '2026-10', '2027-01']
+export const webhookEndpointStatusChangeReasonValues: ReadonlyArray<
+  FlattenedDeepRequired<components>['schemas']['WebhookEndpointStatusChangeReason']
+> = ['manual', 'consecutive_failures', 'admin']
 export const webhookEndpointUpdateApi_versionAnyOf0Values: ReadonlyArray<
   FlattenedDeepRequired<components>['schemas']['WebhookEndpointUpdate']['api_version']
 > = ['2026-04', '2026-10', '2027-01']

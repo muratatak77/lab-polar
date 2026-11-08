@@ -5,8 +5,12 @@ import pytest
 from pytest_mock import MockerFixture
 
 from polar.config import settings
+from polar.kit.pagination import PaginationParams
 from polar.models import WebhookEndpoint, WebhookEvent
 from polar.models.webhook_endpoint import WebhookEventType
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.postgres import AsyncSession
 from polar.version import CURRENT_API_VERSION
 from polar.webhook.service import webhook as webhook_service
@@ -81,6 +85,19 @@ class TestOnEventFailed:
         # Check that the endpoint is now disabled
         await session.refresh(webhook_endpoint_organization)
         assert webhook_endpoint_organization.enabled is False
+        assert webhook_endpoint_organization.disabled_at is not None
+
+        status_changes, count = await webhook_service.list_endpoint_status_changes(
+            session,
+            webhook_endpoint_organization,
+            pagination=PaginationParams(limit=10, page=1),
+        )
+        assert count == 1
+        assert status_changes[0].enabled is False
+        assert (
+            status_changes[0].reason
+            == WebhookEndpointStatusChangeReason.consecutive_failures
+        )
 
     async def test_does_not_disable_endpoint_below_threshold(
         self,

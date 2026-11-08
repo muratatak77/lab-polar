@@ -10,6 +10,7 @@ from polar.auth.models import AuthSubject
 from polar.auth.scope import Scope
 from polar.checkout.eventstream import CheckoutEvent
 from polar.exceptions import PolarRequestValidationError, ResourceNotFound
+from polar.kit.pagination import PaginationParams
 from polar.kit.schemas import HttpsUrl
 from polar.kit.utils import utc_now
 from polar.models import (
@@ -20,6 +21,9 @@ from polar.models import (
     WebhookEvent,
 )
 from polar.models.webhook_endpoint import WebhookEventType, WebhookFormat
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.postgres import AsyncSession
 from polar.version import CURRENT_API_VERSION
 from polar.webhook.repository import WebhookDeliveryRepository
@@ -178,6 +182,92 @@ class TestUpdateEndpoint:
                 endpoint=endpoint,
                 update_schema=WebhookEndpointUpdate(enabled=True),
             )
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_disable_records_status_change(
+        self,
+        auth_subject: AuthSubject[Organization],
+        session: AsyncSession,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        updated_endpoint = await webhook_service.update_endpoint(
+            session,
+            auth_subject,
+            endpoint=webhook_endpoint_organization,
+            update_schema=WebhookEndpointUpdate(enabled=False),
+        )
+
+        assert updated_endpoint.enabled is False
+        assert updated_endpoint.disabled_at is not None
+
+        status_changes, count = await webhook_service.list_endpoint_status_changes(
+            session, updated_endpoint, pagination=PaginationParams(limit=10, page=1)
+        )
+        assert count == 1
+        assert status_changes[0].enabled is False
+        assert status_changes[0].reason == WebhookEndpointStatusChangeReason.manual
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_enable_clears_disabled_at(
+        self,
+        auth_subject: AuthSubject[Organization],
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        organization: Organization,
+    ) -> None:
+        endpoint = WebhookEndpoint(
+            url="https://example.com/hook",
+            format=WebhookFormat.raw,
+            organization_id=organization.id,
+            secret="foobar",
+            enabled=False,
+            disabled_at=utc_now() - timedelta(days=1),
+        )
+        await save_fixture(endpoint)
+
+        updated_endpoint = await webhook_service.update_endpoint(
+            session,
+            auth_subject,
+            endpoint=endpoint,
+            update_schema=WebhookEndpointUpdate(enabled=True),
+        )
+
+        assert updated_endpoint.enabled is True
+        assert updated_endpoint.disabled_at is None
+
+        status_changes, count = await webhook_service.list_endpoint_status_changes(
+            session, updated_endpoint, pagination=PaginationParams(limit=10, page=1)
+        )
+        assert count == 1
+        assert status_changes[0].enabled is True
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    async def test_unchanged_enabled_records_nothing(
+        self,
+        auth_subject: AuthSubject[Organization],
+        session: AsyncSession,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        await webhook_service.update_endpoint(
+            session,
+            auth_subject,
+            endpoint=webhook_endpoint_organization,
+            update_schema=WebhookEndpointUpdate(enabled=True),
+        )
+
+        _, count = await webhook_service.list_endpoint_status_changes(
+            session,
+            webhook_endpoint_organization,
+            pagination=PaginationParams(limit=10, page=1),
+        )
+        assert count == 0
+        assert webhook_endpoint_organization.disabled_at is None
 
 
 @pytest.mark.anyio

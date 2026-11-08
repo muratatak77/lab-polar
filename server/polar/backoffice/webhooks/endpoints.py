@@ -9,9 +9,13 @@ from tagflow import attr, tag, text
 from polar.backoffice.routing import BackofficeRouter
 from polar.kit.pagination import PaginationParamsQuery
 from polar.models import Organization, WebhookEndpoint
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.postgres import AsyncSession, get_db_read_session, get_db_session
 from polar.webhook.repository import WebhookEndpointRepository
 from polar.webhook.schemas import validate_hostname
+from polar.webhook.service import webhook as webhook_service
 from polar.webhook.sorting import WebhookSortProperty
 
 from ..components import button, confirmation_dialog, datatable, description_list, input
@@ -151,6 +155,9 @@ async def get(
                                     "enabled", "Enabled"
                                 ),
                                 description_list.DescriptionListDateTimeItem(
+                                    "disabled_at", "Disabled At"
+                                ),
+                                description_list.DescriptionListDateTimeItem(
                                     "created_at", "Created At"
                                 ),
                                 description_list.DescriptionListDateTimeItem(
@@ -282,10 +289,12 @@ async def toggle_enabled(
                 pass
             return
 
-    webhook = await repository.update(
-        webhook, update_dict={"enabled": not webhook.enabled}
+    webhook = await webhook_service.set_endpoint_enabled(
+        session,
+        webhook,
+        not webhook.enabled,
+        reason=WebhookEndpointStatusChangeReason.admin,
     )
-    await session.flush()
 
     await add_toast(
         request,
@@ -303,6 +312,7 @@ async def toggle_enabled(
             description_list.DescriptionListAttrItem("url", "URL"),
             description_list.DescriptionListAttrItem("format", "Format"),
             description_list.DescriptionListAttrItem("enabled", "Enabled"),
+            description_list.DescriptionListDateTimeItem("disabled_at", "Disabled At"),
             description_list.DescriptionListDateTimeItem("created_at", "Created At"),
             description_list.DescriptionListDateTimeItem("modified_at", "Modified At"),
         ).render(request, webhook):
