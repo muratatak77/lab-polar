@@ -176,6 +176,7 @@ class TestWebhookEndpointSchema:
             "organization_id": uuid4(),
             "events": [],
             "enabled": True,
+            "disabled_at": None,
             "secret_generated_at": None,
             "external_id": None,
         }

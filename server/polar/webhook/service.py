@@ -59,6 +59,10 @@ from polar.models.webhook_endpoint import (
     WebhookEventType,
     WebhookFormat,
 )
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChange,
+    WebhookEndpointStatusChangeReason,
+)
 from polar.organization.resolver import get_payload_organization
 from polar.user_organization.service import (
     user_organization as user_organization_service,
@@ -67,6 +71,7 @@ from polar.version import CURRENT_API_VERSION
 from polar.webhook.repository import (
     WebhookDeliveryRepository,
     WebhookEndpointRepository,
+    WebhookEndpointStatusChangeRepository,
     WebhookEventRepository,
 )
 from polar.worker import enqueue_job
@@ -262,9 +267,62 @@ class WebhookService:
         if "secret" in update_dict:
             update_dict["secret_generated_at"] = None
 
+        enabled = update_dict.pop("enabled", None)
+        if enabled is not None:
+            await self.set_endpoint_enabled(
+                session,
+                endpoint,
+                enabled,
+                reason=WebhookEndpointStatusChangeReason.manual,
+            )
+
         return await repository.update(
             endpoint,
             update_dict=update_dict,
+        )
+
+    async def set_endpoint_enabled(
+        self,
+        session: AsyncSession,
+        endpoint: WebhookEndpoint,
+        enabled: bool,
+        *,
+        reason: WebhookEndpointStatusChangeReason,
+    ) -> WebhookEndpoint:
+        if endpoint.enabled == enabled:
+            return endpoint
+
+        repository = WebhookEndpointRepository.from_session(session)
+        endpoint = await repository.update(
+            endpoint,
+            update_dict={
+                "enabled": enabled,
+                "disabled_at": None if enabled else utc_now(),
+            },
+        )
+
+        status_change_repository = WebhookEndpointStatusChangeRepository.from_session(
+            session
+        )
+        await status_change_repository.create(
+            WebhookEndpointStatusChange(
+                webhook_endpoint=endpoint, enabled=enabled, reason=reason
+            ),
+            flush=True,
+        )
+        return endpoint
+
+    async def list_endpoint_status_changes(
+        self,
+        session: AsyncSession,
+        endpoint: WebhookEndpoint,
+        *,
+        pagination: PaginationParams,
+    ) -> tuple[Sequence[WebhookEndpointStatusChange], int]:
+        repository = WebhookEndpointStatusChangeRepository.from_session(session)
+        statement = repository.get_by_endpoint_statement(endpoint.id)
+        return await repository.paginate(
+            statement, limit=pagination.limit, page=pagination.page
         )
 
     async def reset_endpoint_secret(
@@ -476,11 +534,11 @@ class WebhookService:
                 webhook_endpoint_id=endpoint.id,
                 failure_count=len(recent_outcomes),
             )
-            webhook_endpoint_repository = WebhookEndpointRepository.from_session(
-                session
-            )
-            await webhook_endpoint_repository.update(
-                endpoint, update_dict={"enabled": False}, flush=True
+            await self.set_endpoint_enabled(
+                session,
+                endpoint,
+                False,
+                reason=WebhookEndpointStatusChangeReason.consecutive_failures,
             )
 
             # Mark all pending events as skipped

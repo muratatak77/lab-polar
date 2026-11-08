@@ -24,6 +24,9 @@ from .schemas import (
 )
 from .schemas import WebhookDelivery as WebhookDeliverySchema
 from .schemas import WebhookEndpoint as WebhookEndpointSchema
+from .schemas import (
+    WebhookEndpointStatusChange as WebhookEndpointStatusChangeSchema,
+)
 from .service import AmbiguousExternalWebhookEndpointID
 from .service import webhook as webhook_service
 
@@ -257,6 +260,39 @@ async def delete_webhook_endpoint(
         raise ResourceNotFound()
 
     await webhook_service.delete_endpoint(session, auth_subject, endpoint=endpoint)
+
+
+@router.get(
+    "/endpoints/{id}/status-changes",
+    summary="List Webhook Endpoint Status Changes",
+    response_model=ListResource[WebhookEndpointStatusChangeSchema],
+    responses={404: WebhookEndpointNotFound},
+)
+@version(starting_from=V2027_01)
+async def list_webhook_endpoint_status_changes(
+    id: WebhookEndpointID,
+    pagination: PaginationParamsQuery,
+    auth_subject: WebhooksRead,
+    session: AsyncSession = Depends(get_db_session),
+) -> ListResource[WebhookEndpointStatusChangeSchema]:
+    """
+    List the times a webhook endpoint was enabled or disabled, most recent first.
+    """
+    endpoint = await webhook_service.get_endpoint(session, auth_subject, id)
+    if not endpoint:
+        raise ResourceNotFound()
+
+    results, count = await webhook_service.list_endpoint_status_changes(
+        session, endpoint, pagination=pagination
+    )
+    return ListResource.from_paginated_results(
+        [
+            WebhookEndpointStatusChangeSchema.model_validate(result)
+            for result in results
+        ],
+        count,
+        pagination,
+    )
 
 
 @router.get(

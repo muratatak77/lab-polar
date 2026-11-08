@@ -6,10 +6,15 @@ import pytest
 
 from polar.backoffice import app as backoffice_app
 from polar.backoffice.dependencies import get_admin
+from polar.kit.pagination import PaginationParams
 from polar.models import Organization, User, WebhookEndpoint
 from polar.models.user_session import UserSession
 from polar.models.webhook_endpoint import WebhookFormat
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.postgres import AsyncSession, get_db_read_session, get_db_session
+from polar.webhook.service import webhook as webhook_service
 from tests.fixtures.database import SaveFixture
 
 
@@ -93,6 +98,14 @@ class TestToggleEnabled:
         assert "Webhook disabled successfully" in response.text
         await session.refresh(endpoint)
         assert endpoint.enabled is False
+        assert endpoint.disabled_at is not None
+
+        status_changes, _ = await webhook_service.list_endpoint_status_changes(
+            session, endpoint, pagination=PaginationParams(limit=10, page=1)
+        )
+        assert [(c.enabled, c.reason) for c in status_changes] == [
+            (False, WebhookEndpointStatusChangeReason.admin)
+        ]
 
     async def test_reject_enable_with_localhost_url(
         self,

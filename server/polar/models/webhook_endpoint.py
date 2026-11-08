@@ -101,6 +101,9 @@ class WebhookEndpoint(ExternalIDMixin, RecordModel):
         APIVersionType, nullable=False, default=CURRENT_API_VERSION
     )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True, default=None
+    )
 
     organization_id: Mapped[UUID] = mapped_column(
         Uuid,

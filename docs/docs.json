@@ -1416,7 +1416,8 @@
                       "GET /v1/webhooks/endpoints/{id}",
                       "GET /v1/webhooks/endpoints",
                       "PATCH /v1/webhooks/endpoints/{id}",
-                      "DELETE /v1/webhooks/endpoints/{id}"
+                      "DELETE /v1/webhooks/endpoints/{id}",
+                      "GET /v1/webhooks/endpoints/{id}/status-changes"
                     ]
                   }
                 ]

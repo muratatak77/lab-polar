@@ -6,9 +6,11 @@ import { ConfirmModal } from '@/components/Modal/ConfirmModal'
 import { useModal } from '@/components/Modal/useModal'
 import WebhookContextView from '@/components/Settings/Webhook/WebhookContextView'
 import DeliveriesTable from '@/components/Settings/Webhook/WebhookDeliveriesTable'
+import { WebhookDisabledNotice } from '@/components/Settings/Webhook/WebhookDisabledNotice'
 import { WebhookFilter } from '@/components/Settings/Webhook/WebhookFilter'
 import { WebhookSignatureNotice } from '@/components/Settings/Webhook/WebhookSignatureNotice'
 import { WebhookSigningSchemeStatus } from '@/components/Settings/Webhook/WebhookSigningSchemeStatus'
+import { WebhookStatusHistory } from '@/components/Settings/Webhook/WebhookStatusHistory'
 import { toast } from '@/components/Toast/use-toast'
 import { getStatusRedirect } from '@/components/Toast/utils'
 import {
@@ -16,6 +18,7 @@ import {
   useEditWebhookEndpoint,
   useResetSecretWebhookEndpoint,
   useWebhookEndpoint,
+  useWebhookEndpointStatusChanges,
 } from '@/hooks/queries'
 import { useIsManagedAsCode } from '@/hooks/permissions'
 import { useDataTableQueryState } from '@/hooks/useDataTableQueryState'
@@ -52,6 +55,7 @@ export default function ClientPage({
     useQueryStates(filterParsers)
 
   const { data: endpoint } = useWebhookEndpoint(id)
+  const { data: statusChanges } = useWebhookEndpointStatusChanges(id, 10)
 
   const editWebhookEndpoint = useEditWebhookEndpoint()
   const managedAsCode = useIsManagedAsCode(organization.id)
@@ -166,6 +170,10 @@ export default function ClientPage({
       wide
     >
       <WebhookSignatureNotice organizationCreatedAt={organization.created_at} />
+      <WebhookDisabledNotice
+        endpoint={endpoint}
+        latestStatusChange={statusChanges?.items[0]}
+      />
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 flex-col gap-1">
@@ -204,6 +212,7 @@ export default function ClientPage({
           buttonLabel="Copy Secret"
         />
       </div>
+      <WebhookStatusHistory statusChanges={statusChanges?.items ?? []} />
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-4">
           <h2 className="text-xl font-medium">Deliveries</h2>

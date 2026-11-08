@@ -194,6 +194,14 @@ Webhook endpoints are automatically disabled after **10 consecutive failed deliv
 - The endpoint is marked as disabled and will no longer receive new events.
 - All organization members will receive an email notification.
 
+The endpoint's settings page shows when it was disabled and why, along with every earlier time it was enabled or disabled. From API version `2027-01`, the endpoint's `disabled_at` field holds the time it was last disabled, and the [status changes endpoint](/api-reference/next/webhooks/list-webhook-endpoint-status-changes) lists each change with its reason:
+
+| Reason                 | Meaning                                                          |
+| ---------------------- | ---------------------------------------------------------------- |
+| `manual`               | Changed from the dashboard or through the API.                   |
+| `consecutive_failures` | Disabled by Polar after 10 consecutive failed deliveries.        |
+| `admin`                | Changed by Polar's support team.                                 |
+
 To re-enable a disabled endpoint, open your organization's [webhook settings](https://polar.sh/to/dashboard/settings/webhooks) and manually enable it. Before re-enabling, ensure your endpoint is properly configured and reachable to avoid repeated disabling.
 
 ## Troubleshooting

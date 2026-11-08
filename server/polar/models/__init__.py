@@ -142,6 +142,7 @@ from .wallet import Wallet
 from .wallet_transaction import WalletTransaction
 from .webhook_delivery import WebhookDelivery
 from .webhook_endpoint import WebhookEndpoint
+from .webhook_endpoint_status_change import WebhookEndpointStatusChange
 from .webhook_event import WebhookEvent
 
 __all__ = [
@@ -284,5 +285,6 @@ __all__ = [
     "WalletTransaction",
     "WebhookDelivery",
     "WebhookEndpoint",
+    "WebhookEndpointStatusChange",
     "WebhookEvent",
 ]

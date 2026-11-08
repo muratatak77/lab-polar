@@ -25,11 +25,19 @@ from polar.kit.schemas import (
     Schema,
     TimestampedSchema,
 )
-from polar.kit.versioning import _ACTIVE_API_VERSION, APIVersion, QuerySchema
+from polar.kit.versioning import (
+    _ACTIVE_API_VERSION,
+    APIVersion,
+    QuerySchema,
+    Version,
+)
 from polar.models.webhook_endpoint import WebhookEventType, WebhookFormat
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.openapi import destructive_when_equals
 from polar.organization.schemas import OrganizationID
-from polar.version import CURRENT_API_VERSION, VERSIONS
+from polar.version import CURRENT_API_VERSION, V2027_01, VERSIONS
 from polar.webhook.constants import (
     uses_standard_webhook_signature as secret_uses_standard_webhook_signature,
 )
@@ -156,6 +164,16 @@ class WebhookEndpoint(IDSchema, TimestampedSchema, ExternalIDOutputMixin):
     enabled: bool = Field(
         description="Whether the webhook endpoint is enabled and will receive events."
     )
+    disabled_at: Annotated[
+        datetime | None,
+        Version(starting_from=V2027_01),
+        Field(
+            description=(
+                "When the webhook endpoint was last disabled. "
+                "`null` if the endpoint is enabled."
+            )
+        ),
+    ]
     secret_generated_at: SkipJsonSchema[datetime | None] = Field(
         default=None, exclude=True
     )
@@ -292,6 +310,26 @@ class WebhookDelivery(IDSchema, TimestampedSchema):
     )
     webhook_event: WebhookEvent = Field(
         description="The webhook event sent by this delivery."
+    )
+
+
+class WebhookEndpointStatusChange(IDSchema, TimestampedSchema):
+    """
+    A change of a webhook endpoint's enabled state.
+    """
+
+    webhook_endpoint_id: UUID4 = Field(
+        description="The ID of the webhook endpoint that changed."
+    )
+    enabled: bool = Field(
+        description="Whether the webhook endpoint was enabled or disabled."
+    )
+    reason: WebhookEndpointStatusChangeReason = Field(
+        description=(
+            "Why the state changed. `manual` when changed through the API or the "
+            "dashboard, `consecutive_failures` when Polar disabled the endpoint "
+            "after too many failed deliveries, `admin` when changed by Polar's support."
+        )
     )
 
 

@@ -16,6 +16,7 @@ from polar.kit.repository import (
 from polar.models import (
     WebhookDelivery,
     WebhookEndpoint,
+    WebhookEndpointStatusChange,
     WebhookEvent,
 )
 
@@ -231,3 +232,23 @@ class WebhookEndpointRepository(
         )
         result = await self.session.execute(statement)
         return result.scalars().all()
+
+
+class WebhookEndpointStatusChangeRepository(
+    RepositorySoftDeletionIDMixin[WebhookEndpointStatusChange, UUID],
+    RepositorySoftDeletionMixin[WebhookEndpointStatusChange],
+    RepositoryBase[WebhookEndpointStatusChange],
+):
+    model = WebhookEndpointStatusChange
+
+    def get_by_endpoint_statement(
+        self, endpoint_id: UUID
+    ) -> Select[WebhookEndpointStatusChange]:
+        return (
+            self.get_base_statement()
+            .where(WebhookEndpointStatusChange.webhook_endpoint_id == endpoint_id)
+            .order_by(
+                WebhookEndpointStatusChange.created_at.desc(),
+                WebhookEndpointStatusChange.id.desc(),
+            )
+        )

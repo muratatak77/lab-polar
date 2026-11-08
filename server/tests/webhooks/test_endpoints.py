@@ -1,12 +1,18 @@
+from datetime import timedelta
+
 import pytest
 from httpx import AsyncClient
 
 from polar.auth.scope import Scope
-from polar.models import User
+from polar.kit.utils import utc_now
+from polar.models import User, WebhookEndpointStatusChange
 from polar.models.organization import Organization
 from polar.models.user_organization import OrganizationRole, UserOrganization
 from polar.models.webhook_delivery import WebhookDelivery
 from polar.models.webhook_endpoint import WebhookEndpoint
+from polar.models.webhook_endpoint_status_change import (
+    WebhookEndpointStatusChangeReason,
+)
 from polar.version import V2026_04, V2026_10, V2027_01
 from tests.fixtures.auth import AuthSubjectFixture
 from tests.fixtures.database import SaveFixture
@@ -332,6 +338,40 @@ class TestUpdateWebhookEndpoint:
         assert json["secret"] == old_secret
         assert json["url"] == "https://example.com/hook-updated"
 
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2027_01)
+    async def test_disable_sets_disabled_at(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}",
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["enabled"] is False
+        assert json["disabled_at"] is not None
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_write})
+    )
+    @pytest.mark.api_version(V2026_04, V2026_10)
+    async def test_disabled_at_not_available_before_2027_01(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.patch(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}",
+            json={"enabled": False},
+        )
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["enabled"] is False
+        assert "disabled_at" not in json
+
 
 @pytest.mark.anyio
 class TestDeleteWebhookEndpoint:
@@ -384,6 +424,97 @@ class TestDeleteWebhookEndpoint:
         )
 
         assert response.status_code == 204
+
+
+@pytest.mark.anyio
+class TestListWebhookEndpointStatusChanges:
+    @pytest.mark.api_version(V2027_01)
+    async def test_unauthenticated(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.get(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}/status-changes"
+        )
+
+        assert response.status_code == 401
+
+    @pytest.mark.api_version(V2027_01)
+    @pytest.mark.auth
+    async def test_not_member(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.get(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}/status-changes"
+        )
+
+        assert response.status_code == 404
+
+    @pytest.mark.api_version(V2027_01)
+    @pytest.mark.auth(
+        AuthSubjectFixture(scopes={Scope.webhooks_read}),
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_read}),
+    )
+    async def test_valid(
+        self,
+        save_fixture: SaveFixture,
+        client: AsyncClient,
+        user_organization: UserOrganization,
+        organization: Organization,
+        webhook_endpoint_organization: WebhookEndpoint,
+    ) -> None:
+        now = utc_now()
+        disabled = WebhookEndpointStatusChange(
+            webhook_endpoint=webhook_endpoint_organization,
+            enabled=False,
+            reason=WebhookEndpointStatusChangeReason.consecutive_failures,
+            created_at=now - timedelta(hours=2),
+        )
+        enabled = WebhookEndpointStatusChange(
+            webhook_endpoint=webhook_endpoint_organization,
+            enabled=True,
+            reason=WebhookEndpointStatusChangeReason.manual,
+            created_at=now - timedelta(hours=1),
+        )
+        other_endpoint = await create_webhook_endpoint(
+            save_fixture, organization=organization
+        )
+        other = WebhookEndpointStatusChange(
+            webhook_endpoint=other_endpoint,
+            enabled=False,
+            reason=WebhookEndpointStatusChangeReason.manual,
+        )
+        for status_change in (disabled, enabled, other):
+            await save_fixture(status_change)
+
+        response = await client.get(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}/status-changes"
+        )
+
+        assert response.status_code == 200
+        json = response.json()
+        assert json["pagination"]["total_count"] == 2
+        assert [item["id"] for item in json["items"]] == [
+            str(enabled.id),
+            str(disabled.id),
+        ]
+        assert json["items"][1]["enabled"] is False
+        assert json["items"][1]["reason"] == "consecutive_failures"
+        assert json["items"][1]["webhook_endpoint_id"] == str(
+            webhook_endpoint_organization.id
+        )
+
+    @pytest.mark.api_version(V2026_04, V2026_10)
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="organization", scopes={Scope.webhooks_read})
+    )
+    async def test_not_available_before_2027_01(
+        self, client: AsyncClient, webhook_endpoint_organization: WebhookEndpoint
+    ) -> None:
+        response = await client.get(
+            f"/v1/webhooks/endpoints/{webhook_endpoint_organization.id}/status-changes"
+        )
+
+        assert response.status_code == 404
 
 
 @pytest.mark.anyio

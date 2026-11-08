@@ -77,6 +77,18 @@ export const useWebhookEndpoint = (id?: string) =>
     enabled: !!id,
   })
 
+export const useWebhookEndpointStatusChanges = (id: string, limit: number) =>
+  useQuery({
+    queryKey: ['webhookEndpointStatusChanges', id, { limit }],
+    queryFn: () =>
+      unwrap(
+        api.GET('/v1/webhooks/endpoints/{id}/status-changes', {
+          params: { path: { id }, query: { limit } },
+        }),
+      ),
+    retry: defaultRetry,
+  })
+
 export const useCreateWebhookEndpoint = () =>
   useMutation({
     mutationFn: (body: schemas['WebhookEndpointCreate']) =>
@@ -118,6 +130,10 @@ export const useEditWebhookEndpoint = () =>
 
       queryClient.invalidateQueries({
         queryKey: ['webhookEndpoint', 'id', variables.id],
+      })
+
+      queryClient.invalidateQueries({
+        queryKey: ['webhookEndpointStatusChanges', variables.id],
       })
     },
   })

@@ -4562,6 +4562,159 @@
         ]
       }
     },
+    "/v1/webhooks/endpoints/{id}/status-changes": {
+      "get": {
+        "tags": [
+          "webhooks",
+          "public",
+          "mcp",
+          "cli"
+        ],
+        "summary": "List Webhook Endpoint Status Changes",
+        "description": "List the times a webhook endpoint was enabled or disabled, most recent first.\n\n**Scopes**: `webhooks:read` `webhooks:write`",
+        "operationId": "webhooks:list_webhook_endpoint_status_changes",
+        "security": [
+          {
+            "oidc": [
+              "webhooks:read",
+              "webhooks:write"
+            ]
+          },
+          {
+            "pat": [
+              "webhooks:read",
+              "webhooks:write"
+            ]
+          },
+          {
+            "oat": [
+              "webhooks:read",
+              "webhooks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid4",
+              "description": "The webhook endpoint ID.",
+              "title": "Id"
+            },
+            "description": "The webhook endpoint ID."
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "description": "Page number, defaults to 1.",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number, defaults to 1."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "description": "Size of a page, defaults to 10. Maximum is 100.",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Size of a page, defaults to 10. Maximum is 100."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResource_WebhookEndpointStatusChange_"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Webhook endpoint not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceNotFound"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "x-tool-name": "webhooks_list_webhook_endpoint_status_changes",
+        "x-tool-title": "List Webhook Endpoint Status Changes",
+        "x-tool-description": "List the times a webhook endpoint was enabled or disabled, most recent first.",
+        "x-tool-annotations": [
+          "read_only",
+          "idempotent"
+        ],
+        "x-polar-allowed-subjects": [
+          "Organization",
+          "User"
+        ],
+        "x-speakeasy-pagination": {
+          "type": "offsetLimit",
+          "inputs": [
+            {
+              "name": "page",
+              "in": "parameters",
+              "type": "page"
+            },
+            {
+              "name": "limit",
+              "in": "parameters",
+              "type": "limit"
+            }
+          ],
+          "outputs": {
+            "results": "$.items",
+            "numPages": "$.pagination.max_page"
+          }
+        },
+        "x-speakeasy-group": "webhooks",
+        "x-speakeasy-name-override": "list_webhook_endpoint_status_changes",
+        "x-polar-pagination": {
+          "type": "page_limit",
+          "item_schema": {
+            "$ref": "#/components/schemas/WebhookEndpointStatusChange"
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "python",
+            "source": "from polar.v2027_01 import Polar\n\npolar = Polar(\"polar_oat_xxx\")\n\nfor item in polar.webhooks.iter_list_webhook_endpoint_status_changes(\n    '00000000-0000-4000-8000-000000000000',\n    page=1,\n    limit=10,\n):\n    print(item)\n"
+          },
+          {
+            "lang": "typescript",
+            "source": "import { createPolar } from \"@polar-sh/sdk/2027-01\";\n\nconst polar = createPolar({\n  accessToken: \"polar_oat_xxx\",\n});\n\nfor await (const item of polar.webhooks.iterListWebhookEndpointStatusChanges(\n  \"00000000-0000-4000-8000-000000000000\",\n  {\n    \"page\": 1,\n    \"limit\": 10\n  },\n)) {\n  console.log(item);\n}\n"
+          }
+        ]
+      }
+    },
     "/v1/webhooks/deliveries": {
       "get": {
         "tags": [
@@ -83433,6 +83586,22 @@
             "title": "Enabled",
             "description": "Whether the webhook endpoint is enabled and will receive events."
           },
+          "disabled_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "examples": [
+                  "2026-01-01T00:00:00.000000Z"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Disabled At",
+            "description": "When the webhook endpoint was last disabled. `null` if the endpoint is enabled."
+          },
           "uses_standard_webhook_signature": {
             "type": "boolean",
             "title": "Uses Standard Webhook Signature",
@@ -83453,6 +83622,7 @@
           "organization_id",
           "events",
           "enabled",
+          "disabled_at",
           "uses_standard_webhook_signature"
         ],
         "title": "WebhookEndpoint",
@@ -84882,6 +85052,96 @@
         ],
         "title": "IntrospectTokenRequest",
         "type": "object"
+      },
+      "ListResource_WebhookEndpointStatusChange_": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/WebhookEndpointStatusChange"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "pagination"
+        ],
+        "title": "ListResource[WebhookEndpointStatusChange]"
+      },
+      "WebhookEndpointStatusChange": {
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Creation timestamp of the object.",
+            "examples": [
+              "2026-01-01T00:00:00.000000Z"
+            ]
+          },
+          "modified_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "examples": [
+                  "2026-01-01T00:00:00.000000Z"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modified At",
+            "description": "Last modification timestamp of the object."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid4",
+            "title": "Id",
+            "description": "The ID of the object."
+          },
+          "webhook_endpoint_id": {
+            "type": "string",
+            "format": "uuid4",
+            "title": "Webhook Endpoint Id",
+            "description": "The ID of the webhook endpoint that changed."
+          },
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "description": "Whether the webhook endpoint was enabled or disabled."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/WebhookEndpointStatusChangeReason",
+            "description": "Why the state changed. `manual` when changed through the API or the dashboard, `consecutive_failures` when Polar disabled the endpoint after too many failed deliveries, `admin` when changed by Polar's support."
+          }
+        },
+        "type": "object",
+        "required": [
+          "created_at",
+          "modified_at",
+          "id",
+          "webhook_endpoint_id",
+          "enabled",
+          "reason"
+        ],
+        "title": "WebhookEndpointStatusChange",
+        "description": "A change of a webhook endpoint's enabled state."
+      },
+      "WebhookEndpointStatusChangeReason": {
+        "type": "string",
+        "enum": [
+          "manual",
+          "consecutive_failures",
+          "admin"
+        ],
+        "title": "WebhookEndpointStatusChangeReason"
       }
     },
     "securitySchemes": {
